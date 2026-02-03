@@ -24,7 +24,6 @@ pub enum LoadState {
 struct LoadResult {
     backend: Box<dyn Backend>,
     size: PageSize,
-    path: PathBuf,
 }
 
 pub struct ImageViewer {
@@ -129,11 +128,7 @@ impl ImageViewer {
         backend.open(path)?;
         let size = backend.page_size(0)?;
 
-        Ok(LoadResult {
-            backend,
-            size,
-            path: path.to_path_buf(),
-        })
+        Ok(LoadResult { backend, size })
     }
 
     /// Cancel any in-progress load
@@ -241,10 +236,12 @@ impl ImageViewer {
         self.directory_files = files;
     }
 
+    #[allow(dead_code)]
     pub fn current_path(&self) -> Option<&Path> {
         self.current_path.as_deref()
     }
 
+    #[allow(dead_code)]
     pub fn image_size(&self) -> Option<PageSize> {
         self.image_size
     }
@@ -260,10 +257,63 @@ impl ImageViewer {
         })
     }
 
+    /// Zoom at a specific screen point, keeping that point stationary
+    pub fn zoom_at_point(
+        &mut self,
+        factor: f64,
+        screen_x: f64,
+        screen_y: f64,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) {
+        let Some((img_w, img_h)) = self.effective_size() else {
+            return;
+        };
+
+        let old_zoom = self.zoom.level;
+        let scaled_w = img_w * old_zoom;
+        let scaled_h = img_h * old_zoom;
+
+        // Calculate image coordinate under mouse
+        // If image is centered (smaller than viewport), adjust for centering offset
+        let img_x = if scaled_w < viewport_width {
+            screen_x - (viewport_width - scaled_w) / 2.0
+        } else {
+            screen_x + self.scroll.offset_x
+        };
+
+        let img_y = if scaled_h < viewport_height {
+            screen_y - (viewport_height - scaled_h) / 2.0
+        } else {
+            screen_y + self.scroll.offset_y
+        };
+
+        // Apply zoom
+        self.zoom.zoom_at_point(factor, 0.0, 0.0);
+        let new_zoom = self.zoom.level;
+
+        // Calculate new scroll offset to keep the same image point under mouse
+        let zoom_ratio = new_zoom / old_zoom;
+        let new_img_x = img_x * zoom_ratio;
+        let new_img_y = img_y * zoom_ratio;
+
+        // New offset = new image coord - screen coord
+        let new_scaled_w = img_w * new_zoom;
+        let new_scaled_h = img_h * new_zoom;
+
+        if new_scaled_w > viewport_width {
+            self.scroll.offset_x = new_img_x - screen_x;
+        }
+        if new_scaled_h > viewport_height {
+            self.scroll.offset_y = new_img_y - screen_y;
+        }
+    }
+
     pub fn is_animated(&self) -> bool {
         self.backend.as_ref().map(|b| b.is_animated()).unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub fn frame_count(&self) -> usize {
         self.backend.as_ref().map(|b| b.page_count()).unwrap_or(1)
     }
@@ -315,6 +365,7 @@ impl ImageViewer {
     }
 
     /// Get the current render scale
+    #[allow(dead_code)]
     pub fn current_scale(&self) -> f64 {
         self.surface_scale
     }

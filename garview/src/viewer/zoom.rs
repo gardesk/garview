@@ -78,6 +78,11 @@ impl ZoomState {
         self.mode = ZoomMode::Fit;
     }
 
+    /// Set zoom to fill (may crop)
+    pub fn zoom_fill(&mut self) {
+        self.mode = ZoomMode::Fill;
+    }
+
     /// Set zoom to 100%
     pub fn zoom_one_to_one(&mut self) {
         self.mode = ZoomMode::OneToOne;
@@ -85,6 +90,7 @@ impl ZoomState {
     }
 
     /// Set a specific zoom level
+    #[allow(dead_code)]
     pub fn set_level(&mut self, level: f64) {
         let level = level.clamp(self.min_level, self.max_level);
         self.mode = ZoomMode::Custom(level);

@@ -20,6 +20,7 @@ impl StatusBar {
         }
     }
 
+    #[allow(dead_code)]
     pub fn height(&self) -> u32 {
         self.height
     }

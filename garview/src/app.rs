@@ -3,8 +3,9 @@ use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
 use std::path::Path;
-use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
+use crate::config::Config;
 use crate::ui::{StatusBar, STATUS_BAR_HEIGHT};
 use crate::viewer::{ImageViewer, LoadState};
 
@@ -16,20 +17,27 @@ pub struct App {
     viewer: ImageViewer,
     statusbar: StatusBar,
     #[allow(dead_code)]
+    config: Config,
     fullscreen: bool,
     needs_redraw: bool,
 }
 
 impl App {
     pub fn new(path: Option<String>, fullscreen: bool) -> Result<Self> {
+        // Load configuration
+        let config = Config::load().unwrap_or_else(|e| {
+            tracing::warn!("Failed to load config: {}, using defaults", e);
+            Config::default()
+        });
+
         let conn = Connection::connect(None).context("Failed to connect to X11")?;
 
-        let config = WindowConfig::new()
+        let window_config = WindowConfig::new()
             .title("garview")
             .class("garview")
             .size(1280, 720);
 
-        let window = Window::create(conn.clone(), config).context("Failed to create window")?;
+        let window = Window::create(conn.clone(), window_config).context("Failed to create window")?;
 
         // Create GC for rendering
         let gc = conn.generate_id()?;
@@ -44,6 +52,14 @@ impl App {
 
         let statusbar = StatusBar::new(theme);
         let mut viewer = ImageViewer::new();
+
+        // Apply default zoom from config
+        match config.general.default_zoom.as_str() {
+            "fit" => viewer.zoom.zoom_fit(),
+            "fill" => viewer.zoom.zoom_fill(),
+            "1:1" | "100%" => viewer.zoom.zoom_one_to_one(),
+            _ => viewer.zoom.zoom_fit(),
+        }
 
         // Load initial file if provided
         if let Some(ref path_str) = path {
@@ -64,6 +80,7 @@ impl App {
             gc,
             viewer,
             statusbar,
+            config,
             fullscreen,
             needs_redraw: true,
         })
@@ -154,6 +171,17 @@ impl App {
                         self.viewer.zoom.zoom_fit();
                         self.needs_redraw = true;
                     }
+                    Key::Char('F') => {
+                        self.viewer.zoom.zoom_fill();
+                        self.needs_redraw = true;
+                    }
+
+                    // Fullscreen
+                    Key::F11 => {
+                        if let Err(e) = self.toggle_fullscreen() {
+                            tracing::error!("Failed to toggle fullscreen: {}", e);
+                        }
+                    }
 
                     // Navigation
                     Key::Right | Key::Char('n') | Key::Space => {
@@ -226,10 +254,14 @@ impl App {
                 // Zoom with scroll wheel
                 if scroll_event.modifiers.ctrl {
                     let factor = if scroll_event.delta_y < 0 { 1.1 } else { 0.9 };
-                    self.viewer.zoom.zoom_at_point(
+                    let size = self.renderer.size();
+                    let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                    self.viewer.zoom_at_point(
                         factor,
                         scroll_event.position.x as f64,
                         scroll_event.position.y as f64,
+                        size.width as f64,
+                        viewport_height as f64,
                     );
                 } else {
                     // Pan
@@ -249,6 +281,37 @@ impl App {
         }
 
         Ok(true)
+    }
+
+    /// Toggle fullscreen mode via EWMH _NET_WM_STATE
+    fn toggle_fullscreen(&mut self) -> Result<()> {
+        let conn = self.window.connection();
+        let atoms = self.window.atoms();
+
+        // _NET_WM_STATE client message: action 2 = toggle
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            self.window.id(),
+            atoms.net_wm_state,
+            [
+                2, // action: toggle
+                atoms.net_wm_state_fullscreen,
+                0,
+                1, // source: application
+                0,
+            ],
+        );
+
+        conn.inner().send_event(
+            false,
+            conn.root(),
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            event,
+        )?;
+        conn.flush()?;
+
+        self.fullscreen = !self.fullscreen;
+        Ok(())
     }
 
     fn render(&mut self) -> Result<()> {
@@ -287,7 +350,7 @@ impl App {
             if let Ok(image_surface) = self.viewer.render(zoom) {
                 // Get actual surface dimensions (may differ from target if zoomed out)
                 let surface_w = image_surface.width() as f64;
-                let surface_h = image_surface.height() as f64;
+                let _surface_h = image_surface.height() as f64;
 
                 // Calculate display scale (Cairo will scale the surface to fit)
                 let display_scale = scaled_w / surface_w;

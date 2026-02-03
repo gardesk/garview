@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -10,6 +11,7 @@ pub struct Config {
     pub images: ImageConfig,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct GeneralConfig {
     #[serde(default = "default_zoom")]
@@ -33,6 +35,7 @@ impl Default for GeneralConfig {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageConfig {
     #[serde(default = "default_true")]

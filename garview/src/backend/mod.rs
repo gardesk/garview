@@ -5,11 +5,11 @@ pub use image_backend::ImageBackend;
 pub use svg::SvgBackend;
 
 use anyhow::Result;
-use gartk_core::Rect;
 use std::path::Path;
 use std::time::Duration;
 
 /// Rendered page/frame data
+#[allow(dead_code)]
 pub struct RenderedPage {
     /// RGBA pixel data
     pub data: Vec<u8>,
@@ -17,7 +17,7 @@ pub struct RenderedPage {
     pub width: u32,
     /// Height in pixels
     pub height: u32,
-    /// Page/frame index
+    /// Page/frame index (for multi-page documents)
     pub index: usize,
 }
 
@@ -29,11 +29,12 @@ pub struct PageSize {
 }
 
 /// Backend trait for format-specific rendering
+#[allow(dead_code)]
 pub trait Backend: Send {
-    /// Get the format name
+    /// Get the format name (used for status bar display)
     fn format_name(&self) -> &'static str;
 
-    /// Get supported extensions
+    /// Get supported extensions (used for format detection)
     fn extensions(&self) -> &'static [&'static str];
 
     /// Open a file
