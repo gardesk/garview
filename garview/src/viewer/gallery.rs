@@ -173,10 +173,24 @@ impl GalleryView {
         for i in start_idx..end_idx {
             let path = &self.files[i].path;
 
+            // Skip if we already have a surface
+            if self.surfaces.contains_key(path) {
+                continue;
+            }
+
             // Try to load from disk cache first
-            if !self.cache.get(path).is_some() && !self.cache.is_pending(path) {
+            if self.cache.get(path).is_none() && !self.cache.is_pending(path) {
                 if self.cache.is_cached(path) {
-                    let _ = self.cache.load_cached(path);
+                    if self.cache.load_cached(path).is_ok() {
+                        // Create surface immediately for disk-cached thumbnails
+                        if let Some(thumb) = self.cache.get(path) {
+                            if let Ok(surface) =
+                                Surface::from_rgba(&thumb.data, thumb.width, thumb.height)
+                            {
+                                self.surfaces.insert(path.clone(), surface);
+                            }
+                        }
+                    }
                 } else {
                     self.cache.request(path);
                 }
