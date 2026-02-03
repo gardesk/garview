@@ -684,6 +684,20 @@ impl App {
                 self.needs_redraw = true;
             }
 
+            // Document view mode (V cycles: Single -> Continuous -> Dual)
+            Key::Char('V') => {
+                if self.viewer.is_multipage() {
+                    self.viewer.cycle_view_mode();
+                    let mode_name = match self.viewer.view_mode() {
+                        crate::viewer::DocumentViewMode::SinglePage => "Single Page",
+                        crate::viewer::DocumentViewMode::Continuous => "Continuous",
+                        crate::viewer::DocumentViewMode::DualPage => "Dual Page",
+                    };
+                    tracing::info!("View mode: {}", mode_name);
+                    self.needs_redraw = true;
+                }
+            }
+
             // Pan with arrow keys when zoomed, navigate pages at bounds
             Key::Up if modifiers.is_empty() => {
                 let size = self.renderer.size();
@@ -1151,8 +1165,7 @@ impl App {
                 self.render_continuous(viewport_height)
             }
             crate::viewer::DocumentViewMode::DualPage => {
-                // TODO: Implement dual page view
-                self.render_single_page(viewport_height)
+                self.render_dual_page(viewport_height)
             }
         }
     }
@@ -1407,6 +1420,168 @@ impl App {
         }
 
         ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_dual_page(&mut self, viewport_height: u32) -> Result<()> {
+        let size = self.renderer.size();
+        let page_count = self.viewer.page_count();
+        let current_page = self.viewer.current_page();
+
+        // In dual page mode, show even page on left, odd on right
+        // If current page is odd (1, 3, 5...), show previous page + current
+        // If current page is even (0, 2, 4...), show current + next
+        let (left_page, right_page) = if current_page % 2 == 0 {
+            (current_page, current_page + 1)
+        } else {
+            (current_page.saturating_sub(1), current_page)
+        };
+
+        // Get page sizes
+        let left_size = self.viewer.page_size_for(left_page);
+        let right_size = if right_page < page_count {
+            self.viewer.page_size_for(right_page)
+        } else {
+            None
+        };
+
+        // Calculate combined dimensions
+        let (left_w, left_h) = left_size.map(|s| (s.width, s.height)).unwrap_or((1.0, 1.0));
+        let (right_w, right_h) = right_size.map(|s| (s.width, s.height)).unwrap_or((0.0, 0.0));
+
+        let page_gap = 20.0; // Gap between pages
+        let total_width = left_w + (if right_size.is_some() { right_w + page_gap } else { 0.0 });
+        let max_height = left_h.max(right_h);
+
+        // Update zoom for combined dimensions
+        self.viewer.zoom.update(total_width, max_height, size.width as f64, viewport_height as f64);
+
+        let zoom = self.viewer.zoom.level;
+        let scaled_total_w = total_width * zoom;
+        let scaled_max_h = max_height * zoom;
+        let scaled_left_w = left_w * zoom;
+        let scaled_left_h = left_h * zoom;
+        let scaled_right_w = right_w * zoom;
+        let scaled_right_h = right_h * zoom;
+        let scaled_gap = page_gap * zoom;
+
+        // Clamp scroll
+        self.viewer.scroll.clamp(
+            scaled_total_w,
+            scaled_max_h,
+            size.width as f64,
+            viewport_height as f64,
+        );
+
+        let offset_x = self.viewer.scroll.offset_x;
+        let offset_y = self.viewer.scroll.offset_y;
+
+        // Calculate starting x position (centered if smaller than viewport)
+        let start_x = if scaled_total_w < size.width as f64 {
+            (size.width as f64 - scaled_total_w) / 2.0
+        } else {
+            -offset_x
+        };
+
+        let ctx = self.renderer.context()?;
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, size.width as f64, viewport_height as f64);
+        ctx.clip();
+
+        // Render left page
+        if let Ok(left_surface) = self.viewer.render_page_surface(left_page, zoom) {
+            let surface_w = left_surface.width() as f64;
+            let display_scale = scaled_left_w / surface_w;
+
+            // Center vertically if page is shorter than max height
+            let y = if scaled_left_h < viewport_height as f64 {
+                (viewport_height as f64 - scaled_left_h) / 2.0
+            } else {
+                -offset_y + (scaled_max_h - scaled_left_h) / 2.0
+            };
+
+            ctx.save()?;
+            ctx.translate(start_x, y);
+            ctx.scale(display_scale, display_scale);
+            ctx.set_source_surface(left_surface.cairo_surface(), 0.0, 0.0)?;
+            let filter = if display_scale > 2.0 {
+                gartk_render::cairo::Filter::Nearest
+            } else {
+                gartk_render::cairo::Filter::Bilinear
+            };
+            ctx.source().set_filter(filter);
+            ctx.paint()?;
+            ctx.restore()?;
+        }
+
+        // Render right page (if exists)
+        if right_page < page_count {
+            if let Ok(right_surface) = self.viewer.render_page_surface(right_page, zoom) {
+                let surface_w = right_surface.width() as f64;
+                let display_scale = scaled_right_w / surface_w;
+
+                // Position right page after left page + gap
+                let x = start_x + scaled_left_w + scaled_gap;
+                let y = if scaled_right_h < viewport_height as f64 {
+                    (viewport_height as f64 - scaled_right_h) / 2.0
+                } else {
+                    -offset_y + (scaled_max_h - scaled_right_h) / 2.0
+                };
+
+                ctx.save()?;
+                ctx.translate(x, y);
+                ctx.scale(display_scale, display_scale);
+                ctx.set_source_surface(right_surface.cairo_surface(), 0.0, 0.0)?;
+                let filter = if display_scale > 2.0 {
+                    gartk_render::cairo::Filter::Nearest
+                } else {
+                    gartk_render::cairo::Filter::Bilinear
+                };
+                ctx.source().set_filter(filter);
+                ctx.paint()?;
+                ctx.restore()?;
+            }
+        }
+
+        ctx.restore()?;
+
+        // Show page indicator overlay for dual-page mode
+        let page_text = if right_page < page_count {
+            format!("{}-{}/{}", left_page + 1, right_page + 1, page_count)
+        } else {
+            format!("{}/{}", left_page + 1, page_count)
+        };
+
+        // Draw page indicator in corner
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(12.0);
+        let extents = ctx.text_extents(&page_text)?;
+        let pad = 4.0;
+        let pill_w = extents.width() + pad * 2.0;
+        let pill_h = extents.height() + pad * 2.0;
+        let pill_x = size.width as f64 - pill_w - 10.0;
+        let pill_y = 10.0;
+
+        // Background pill
+        ctx.new_path();
+        let radius = pill_h / 2.0;
+        ctx.arc(pill_x + radius, pill_y + radius, radius, 0.5 * std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(pill_x + pill_w - radius, pill_y + radius, radius, 1.5 * std::f64::consts::PI, 0.5 * std::f64::consts::PI);
+        ctx.close_path();
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+        ctx.fill()?;
+
+        // Text
+        ctx.set_source_rgb(1.0, 1.0, 1.0);
+        ctx.move_to(pill_x + pad, pill_y + pad + extents.height());
+        ctx.show_text(&page_text)?;
+
         Ok(())
     }
 
