@@ -347,7 +347,8 @@ impl ImageViewer {
 
         // For scale <= 1.0, always render at 1.0 and let Cairo downscale (fast)
         // For scale > 1.0 (zoom in), render at target scale for sharpness
-        let render_scale = if scale > 1.0 { scale } else { 1.0 };
+        // Cap at 2.0 to avoid creating massive surfaces - Cairo will upscale beyond that
+        let render_scale = if scale > 1.0 { scale.min(2.0) } else { 1.0 };
 
         // Check if we need to re-render
         let needs_render = self.surface.is_none() || (self.surface_scale - render_scale).abs() > 0.001;
