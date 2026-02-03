@@ -315,8 +315,13 @@ impl App {
                         self.sidebar.toggle();
                         // Update sidebar page count when showing
                         if self.sidebar.visible && self.viewer.is_multipage() {
+                            let current_page = self.viewer.current_page();
                             self.sidebar.set_page_count(self.viewer.page_count());
-                            self.sidebar.selected_page = Some(self.viewer.current_page());
+                            self.sidebar.selected_page = Some(current_page);
+                            // Scroll to show current page
+                            let size = self.renderer.size();
+                            let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                            self.sidebar.scroll_to_page(current_page, viewport_height);
                             // Generate thumbnails for visible pages
                             self.generate_sidebar_thumbnails();
                         }
@@ -482,10 +487,57 @@ impl App {
                                     viewport_height as f64,
                                 );
                             } else {
-                                self.viewer.scroll.pan(
-                                    scroll_event.delta_x as f64 * 30.0,
-                                    scroll_event.delta_y as f64 * 30.0,
-                                );
+                                // Single page mode: check for page navigation at bounds
+                                let delta_y = scroll_event.delta_y as f64 * 30.0;
+                                if let Some((img_w, img_h)) = self.viewer.effective_size() {
+                                    let zoom = self.viewer.zoom.level;
+                                    let scaled_h = img_h * zoom;
+
+                                    // Check if scrolling down at bottom → next page
+                                    if delta_y > 0.0 && self.viewer.scroll.at_bottom(scaled_h, viewport_height as f64) {
+                                        if self.viewer.is_multipage() && self.viewer.next_page() {
+                                            self.viewer.scroll.reset();
+                                            // Scroll to top of new page
+                                            if let Some((_, new_h)) = self.viewer.effective_size() {
+                                                let new_scaled_h = new_h * self.viewer.zoom.level;
+                                                self.viewer.scroll.clamp(img_w * zoom, new_scaled_h, size.width as f64, viewport_height as f64);
+                                            }
+                                            // Update sidebar selection
+                                            if self.sidebar.visible {
+                                                self.sidebar.selected_page = Some(self.viewer.current_page());
+                                            }
+                                        }
+                                    }
+                                    // Check if scrolling up at top → previous page
+                                    else if delta_y < 0.0 && self.viewer.scroll.at_top(scaled_h, viewport_height as f64) {
+                                        if self.viewer.is_multipage() && self.viewer.prev_page() {
+                                            // Scroll to bottom of new page
+                                            if let Some((new_w, new_h)) = self.viewer.effective_size() {
+                                                let new_zoom = self.viewer.zoom.level;
+                                                let new_scaled_h = new_h * new_zoom;
+                                                let max_y = (new_scaled_h - viewport_height as f64).max(0.0);
+                                                self.viewer.scroll.offset_y = max_y;
+                                                self.viewer.scroll.clamp(new_w * new_zoom, new_scaled_h, size.width as f64, viewport_height as f64);
+                                            }
+                                            // Update sidebar selection
+                                            if self.sidebar.visible {
+                                                self.sidebar.selected_page = Some(self.viewer.current_page());
+                                            }
+                                        }
+                                    } else {
+                                        // Normal scroll
+                                        self.viewer.scroll.pan(
+                                            scroll_event.delta_x as f64 * 30.0,
+                                            delta_y,
+                                        );
+                                    }
+                                } else {
+                                    // No image loaded, just pan
+                                    self.viewer.scroll.pan(
+                                        scroll_event.delta_x as f64 * 30.0,
+                                        delta_y,
+                                    );
+                                }
                             }
                         }
                     }
@@ -566,13 +618,72 @@ impl App {
                 self.needs_redraw = true;
             }
 
-            // Pan with arrow keys when zoomed
+            // Pan with arrow keys when zoomed, navigate pages at bounds
             Key::Up if modifiers.is_empty() => {
-                self.viewer.scroll.pan(0.0, -50.0);
+                let size = self.renderer.size();
+                let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+
+                if let Some((img_w, img_h)) = self.viewer.effective_size() {
+                    let zoom = self.viewer.zoom.level;
+                    let scaled_h = img_h * zoom;
+
+                    // If at top and multipage, go to previous page
+                    if self.viewer.scroll.at_top(scaled_h, viewport_height as f64)
+                        && self.viewer.is_multipage()
+                        && self.viewer.prev_page()
+                    {
+                        // Scroll to bottom of new page
+                        if let Some((new_w, new_h)) = self.viewer.effective_size() {
+                            let new_zoom = self.viewer.zoom.level;
+                            let new_scaled_h = new_h * new_zoom;
+                            let max_y = (new_scaled_h - viewport_height as f64).max(0.0);
+                            self.viewer.scroll.offset_y = max_y;
+                            self.viewer.scroll.clamp(new_w * new_zoom, new_scaled_h, size.width as f64, viewport_height as f64);
+                        }
+                        // Update sidebar selection
+                        if self.sidebar.visible {
+                            self.sidebar.selected_page = Some(self.viewer.current_page());
+                        }
+                    } else {
+                        self.viewer.scroll.pan(0.0, -50.0);
+                        self.viewer.scroll.clamp(img_w * zoom, scaled_h, size.width as f64, viewport_height as f64);
+                    }
+                } else {
+                    self.viewer.scroll.pan(0.0, -50.0);
+                }
                 self.needs_redraw = true;
             }
             Key::Down if modifiers.is_empty() => {
-                self.viewer.scroll.pan(0.0, 50.0);
+                let size = self.renderer.size();
+                let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+
+                if let Some((img_w, img_h)) = self.viewer.effective_size() {
+                    let zoom = self.viewer.zoom.level;
+                    let scaled_h = img_h * zoom;
+
+                    // If at bottom and multipage, go to next page
+                    if self.viewer.scroll.at_bottom(scaled_h, viewport_height as f64)
+                        && self.viewer.is_multipage()
+                        && self.viewer.next_page()
+                    {
+                        self.viewer.scroll.reset();
+                        // Clamp to top of new page
+                        if let Some((new_w, new_h)) = self.viewer.effective_size() {
+                            let new_zoom = self.viewer.zoom.level;
+                            let new_scaled_h = new_h * new_zoom;
+                            self.viewer.scroll.clamp(new_w * new_zoom, new_scaled_h, size.width as f64, viewport_height as f64);
+                        }
+                        // Update sidebar selection
+                        if self.sidebar.visible {
+                            self.sidebar.selected_page = Some(self.viewer.current_page());
+                        }
+                    } else {
+                        self.viewer.scroll.pan(0.0, 50.0);
+                        self.viewer.scroll.clamp(img_w * zoom, scaled_h, size.width as f64, viewport_height as f64);
+                    }
+                } else {
+                    self.viewer.scroll.pan(0.0, 50.0);
+                }
                 self.needs_redraw = true;
             }
 
