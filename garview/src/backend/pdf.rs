@@ -29,6 +29,7 @@ impl PdfBackend {
 
     /// Extract TOC entries recursively from an IndexIter
     fn extract_toc_entries(
+        doc: &Document,
         iter: &mut IndexIter,
         level: usize,
         entries: &mut Vec<(String, usize, usize)>,
@@ -36,18 +37,18 @@ impl PdfBackend {
         loop {
             // Get the action for this entry using FFI
             unsafe {
-                let iter_ptr = iter.to_glib_none().0;
+                let iter_ptr: *mut ffi::PopplerIndexIter = iter.to_glib_none().0;
                 let action_ptr = ffi::poppler_index_iter_get_action(iter_ptr);
 
                 if !action_ptr.is_null() {
                     // Cast to PopplerActionAny to get type and title
                     let action_any = &*(action_ptr as *const ffi::PopplerActionAny);
 
-                    // Get title
+                    // Get title (replace tabs with spaces for clean display)
                     let title = if !action_any.title.is_null() {
                         CStr::from_ptr(action_any.title)
                             .to_string_lossy()
-                            .into_owned()
+                            .replace('\t', " ")
                     } else {
                         String::new()
                     };
@@ -57,8 +58,25 @@ impl PdfBackend {
                         let goto_dest = &*(action_ptr as *const ffi::PopplerActionGotoDest);
                         if !goto_dest.dest.is_null() {
                             let dest = &*goto_dest.dest;
-                            // poppler uses 1-based page numbers, we use 0-based
-                            (dest.page_num.max(1) - 1) as usize
+                            // Check if this is a named destination (type 9 = POPPLER_DEST_NAMED)
+                            if dest.type_ == 9 && !dest.named_dest.is_null() {
+                                // Resolve the named destination to get the actual page
+                                let doc_ptr: *mut ffi::PopplerDocument = doc.to_glib_none().0;
+                                let resolved = ffi::poppler_document_find_dest(doc_ptr, dest.named_dest);
+                                if !resolved.is_null() {
+                                    let resolved_dest = &*resolved;
+                                    let page_num = (resolved_dest.page_num.max(1) - 1) as usize;
+                                    ffi::poppler_dest_free(resolved);
+                                    page_num
+                                } else {
+                                    0
+                                }
+                            } else if dest.page_num > 0 {
+                                // Direct page number destination
+                                (dest.page_num - 1) as usize
+                            } else {
+                                0
+                            }
                         } else {
                             0
                         }
@@ -77,7 +95,7 @@ impl PdfBackend {
 
             // Process children
             if let Some(mut child) = iter.child() {
-                Self::extract_toc_entries(&mut child, level + 1, entries);
+                Self::extract_toc_entries(doc, &mut child, level + 1, entries);
             }
 
             // Move to next sibling
@@ -275,7 +293,7 @@ impl Backend for PdfBackend {
             // IndexIter::new returns an empty iter if no TOC, but we can check
             // by trying to get an action from the first entry
             unsafe {
-                let iter_ptr = iter.to_glib_none().0;
+                let iter_ptr: *mut ffi::PopplerIndexIter = iter.to_glib_none().0;
                 let action_ptr = ffi::poppler_index_iter_get_action(iter_ptr);
                 let has_entries = !action_ptr.is_null();
                 if !action_ptr.is_null() {
@@ -292,7 +310,7 @@ impl Backend for PdfBackend {
         if let Some(ref doc) = self.document {
             let mut iter = IndexIter::new(doc);
             let mut entries = Vec::new();
-            Self::extract_toc_entries(&mut iter, 0, &mut entries);
+            Self::extract_toc_entries(doc, &mut iter, 0, &mut entries);
             entries
         } else {
             Vec::new()
