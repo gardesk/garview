@@ -87,4 +87,23 @@ impl ScrollState {
             self.offset_y = self.offset_y.clamp(0.0, max_y);
         }
     }
+
+    /// Check if at top of scroll bounds
+    pub fn at_top(&self, content_height: f64, viewport_height: f64) -> bool {
+        // If content fits in viewport, always at top
+        if content_height <= viewport_height {
+            return true;
+        }
+        self.offset_y <= 0.0
+    }
+
+    /// Check if at bottom of scroll bounds
+    pub fn at_bottom(&self, content_height: f64, viewport_height: f64) -> bool {
+        // If content fits in viewport, always at bottom
+        if content_height <= viewport_height {
+            return true;
+        }
+        let max_y = content_height - viewport_height;
+        self.offset_y >= max_y - 1.0 // Small tolerance for floating point
+    }
 }
