@@ -162,8 +162,16 @@ impl Backend for PdfBackend {
         rect.set_y2(y2);
 
         // Use selected_text with glyph selection style for accurate word selection
-        p.selected_text(SelectionStyle::Glyph, &mut rect)
-            .map(|s| s.to_string())
+        let result = p.selected_text(SelectionStyle::Glyph, &mut rect)
+            .map(|s| s.to_string());
+
+        tracing::debug!(
+            "PDF get_text_for_area: page={}, rect=({:.1},{:.1})-({:.1},{:.1}), result={:?}",
+            page, x1, y1, x2, y2,
+            result.as_ref().map(|s| s.chars().take(50).collect::<String>())
+        );
+
+        result
     }
 
     fn get_selection_region(

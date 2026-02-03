@@ -1007,6 +1007,10 @@ impl ImageViewer {
 
     /// Start text selection at page coordinates
     pub fn start_selection(&mut self, page_x: f64, page_y: f64) {
+        tracing::debug!(
+            "Starting selection at ({:.1}, {:.1}) on page {}",
+            page_x, page_y, self.current_frame
+        );
         self.selection = TextSelection {
             page: self.current_frame,
             start: (page_x, page_y),
@@ -1047,15 +1051,18 @@ impl ImageViewer {
         let rect = (img_x1, img_y1, img_x2, img_y2);
 
         tracing::debug!(
-            "Selection: image coords ({:.1},{:.1})-({:.1},{:.1})",
-            img_x1, img_y1, img_x2, img_y2
+            "End selection on page {}: raw ({:.1},{:.1})-({:.1},{:.1}) -> normalized ({:.1},{:.1})-({:.1},{:.1})",
+            self.selection.page, x1, y1, x2, y2, img_x1, img_y1, img_x2, img_y2
         );
 
         // Extract text from the backend
         if let Some(backend) = self.backend.as_ref() {
             // Log page size from backend for debugging
             if let Ok(ps) = backend.page_size(self.selection.page) {
-                tracing::debug!("Backend page size: {:.1} x {:.1}", ps.width, ps.height);
+                tracing::debug!(
+                    "Extracting text from page {} (size {:.1}x{:.1}) at rect ({:.1},{:.1})-({:.1},{:.1})",
+                    self.selection.page, ps.width, ps.height, img_x1, img_y1, img_x2, img_y2
+                );
             }
 
             let text = backend.get_text_for_area(self.selection.page, rect);

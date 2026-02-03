@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use arboard::Clipboard;
 use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
@@ -788,8 +787,22 @@ impl App {
 
     /// Copy text to clipboard
     fn copy_to_clipboard(&self, text: &str) -> Result<()> {
-        let mut clipboard = Clipboard::new().context("Failed to access clipboard")?;
-        clipboard.set_text(text).context("Failed to set clipboard text")?;
+        // Use xclip for reliable X11 clipboard handling
+        // arboard has timeout issues with some clipboard managers
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn xclip - is it installed?")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes()).context("Failed to write to xclip")?;
+        }
+
+        child.wait().context("xclip failed")?;
         Ok(())
     }
 
@@ -842,9 +855,10 @@ impl App {
                 // Render page directly at thumbnail scale using backend
                 if let Some(backend) = &mut self.viewer.backend_mut() {
                     if let Ok(rendered) = backend.render_page(page, scale) {
+                        // Use actual rendered dimensions - they must match the data
                         self.sidebar.add_thumbnail(page, ThumbnailData {
-                            width: thumb_w.min(rendered.width),
-                            height: thumb_h.min(rendered.height),
+                            width: rendered.width,
+                            height: rendered.height,
                             data: rendered.data,
                         });
                     }
