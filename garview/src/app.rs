@@ -101,11 +101,6 @@ impl App {
                 }
                 event_loop.redraw_done();
                 self.needs_redraw = false;
-
-                // If showing preview, schedule upgrade to final quality
-                if self.viewer.needs_quality_upgrade() {
-                    event_loop.request_redraw();
-                }
             }
 
             Ok(should_continue)
@@ -278,11 +273,14 @@ impl App {
             let offset_x = self.viewer.scroll.offset_x;
             let offset_y = self.viewer.scroll.offset_y;
 
-            // Render the image (may be preview or final quality)
-            let current_scale = self.viewer.current_scale();
+            // Render the image
             if let Ok(image_surface) = self.viewer.render(zoom) {
-                // Calculate scale factor to upscale preview to target size
-                let upscale = zoom / current_scale;
+                // Get actual surface dimensions (may differ from target if zoomed out)
+                let surface_w = image_surface.width() as f64;
+                let surface_h = image_surface.height() as f64;
+
+                // Calculate display scale (Cairo will scale the surface to fit)
+                let display_scale = scaled_w / surface_w;
 
                 // Calculate position (centered if smaller than viewport)
                 let x = if scaled_w < size.width as f64 {
@@ -300,33 +298,33 @@ impl App {
                 // Draw image using Cairo
                 let ctx = self.renderer.context()?;
 
-                // Apply rotation and flip transforms
                 ctx.save()?;
-                ctx.translate(
-                    x + scaled_w / 2.0,
-                    y + scaled_h / 2.0,
-                );
+                ctx.translate(x, y);
 
-                if rotation != 0 {
-                    ctx.rotate(rotation as f64 * std::f64::consts::PI / 180.0);
+                // Apply rotation and flip around center
+                if rotation != 0 || flip_h || flip_v {
+                    ctx.translate(scaled_w / 2.0, scaled_h / 2.0);
+
+                    if rotation != 0 {
+                        ctx.rotate(rotation as f64 * std::f64::consts::PI / 180.0);
+                    }
+                    if flip_h {
+                        ctx.scale(-1.0, 1.0);
+                    }
+                    if flip_v {
+                        ctx.scale(1.0, -1.0);
+                    }
+
+                    ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
                 }
 
-                if flip_h {
-                    ctx.scale(-1.0, 1.0);
-                }
-                if flip_v {
-                    ctx.scale(1.0, -1.0);
-                }
+                // Scale surface to display size
+                ctx.scale(display_scale, display_scale);
 
-                ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
-
-                // Scale up if showing preview (smooth bilinear filtering)
-                if upscale > 1.001 {
-                    ctx.scale(upscale, upscale);
-                }
-
-                // Paint the image surface
+                // Paint the image surface with good filtering
                 ctx.set_source_surface(image_surface.cairo_surface(), 0.0, 0.0)?;
+                // Use GOOD filter for smooth scaling
+                ctx.source().set_filter(gartk_render::cairo::Filter::Bilinear);
                 ctx.paint()?;
 
                 ctx.restore()?;

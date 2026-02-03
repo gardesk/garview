@@ -5,18 +5,6 @@ use gartk_render::Surface;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Render quality stage
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RenderStage {
-    /// Fast low-res preview
-    Preview,
-    /// Full quality final render
-    Final,
-}
-
-/// Preview scale factor (renders at 1/4 size for speed)
-const PREVIEW_SCALE: f64 = 0.25;
-
 pub struct ImageViewer {
     /// Current backend
     backend: Option<Box<dyn Backend>>,
@@ -26,10 +14,6 @@ pub struct ImageViewer {
     surface: Option<Surface>,
     /// Surface scale (for cache invalidation)
     surface_scale: f64,
-    /// Current render stage
-    render_stage: RenderStage,
-    /// Target scale for final render
-    target_scale: f64,
     /// Image dimensions
     image_size: Option<PageSize>,
     /// Zoom state
@@ -57,8 +41,6 @@ impl ImageViewer {
             current_path: None,
             surface: None,
             surface_scale: 0.0,
-            render_stage: RenderStage::Preview,
-            target_scale: 1.0,
             image_size: None,
             zoom: ZoomState::new(),
             scroll: ScrollState::new(),
@@ -89,8 +71,6 @@ impl ImageViewer {
         self.image_size = Some(size);
         self.surface = None;
         self.surface_scale = 0.0;
-        self.render_stage = RenderStage::Preview;
-        self.target_scale = 1.0;
         self.current_frame = 0;
         self.last_frame_time = Instant::now();
         self.rotation = 0;
@@ -176,66 +156,36 @@ impl ImageViewer {
             self.current_frame = (self.current_frame + 1) % backend.page_count();
             self.last_frame_time = Instant::now();
             self.surface = None; // Invalidate cache
-            self.render_stage = RenderStage::Preview;
             true
         } else {
             false
         }
     }
 
-    /// Check if we need to upgrade from preview to final quality
-    pub fn needs_quality_upgrade(&self) -> bool {
-        self.render_stage == RenderStage::Preview && self.surface.is_some()
-    }
-
     /// Render to a surface at the given scale
-    /// Uses two-stage rendering: fast preview first, then final quality
     pub fn render(&mut self, scale: f64) -> Result<&Surface> {
-        self.target_scale = scale;
+        // For scale <= 1.0, always render at 1.0 and let Cairo downscale (fast)
+        // For scale > 1.0 (zoom in), render at target scale for sharpness
+        let render_scale = if scale > 1.0 { scale } else { 1.0 };
 
-        // Check if scale changed significantly - reset to preview
-        if self.surface.is_some() && (self.surface_scale - scale).abs() > 0.1 {
-            self.surface = None;
-            self.render_stage = RenderStage::Preview;
-        }
-
-        let needs_render = self.surface.is_none();
-        let needs_upgrade = self.render_stage == RenderStage::Preview
-            && self.surface.is_some()
-            && (self.surface_scale - scale).abs() > 0.001;
+        // Check if we need to re-render
+        let needs_render = self.surface.is_none() || (self.surface_scale - render_scale).abs() > 0.001;
 
         if needs_render {
-            // First render: quick preview at reduced scale
-            let preview_scale = (scale * PREVIEW_SCALE).max(0.1);
             let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No image loaded"))?;
-            let page = backend.render_page(self.current_frame, preview_scale)?;
+            let page = backend.render_page(self.current_frame, render_scale)?;
             let surface = Surface::from_rgba(&page.data, page.width, page.height)?;
 
             self.surface = Some(surface);
-            self.surface_scale = preview_scale;
-            self.render_stage = RenderStage::Preview;
-        } else if needs_upgrade {
-            // Upgrade to final quality
-            let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No image loaded"))?;
-            let page = backend.render_page(self.current_frame, scale)?;
-            let surface = Surface::from_rgba(&page.data, page.width, page.height)?;
-
-            self.surface = Some(surface);
-            self.surface_scale = scale;
-            self.render_stage = RenderStage::Final;
+            self.surface_scale = render_scale;
         }
 
         self.surface.as_ref().ok_or_else(|| anyhow!("No surface"))
     }
 
-    /// Get the current render scale (may differ from target during preview)
+    /// Get the current render scale
     pub fn current_scale(&self) -> f64 {
         self.surface_scale
-    }
-
-    /// Check if currently showing preview quality
-    pub fn is_preview(&self) -> bool {
-        self.render_stage == RenderStage::Preview
     }
 
     // Navigation
@@ -278,13 +228,11 @@ impl ImageViewer {
     pub fn rotate_cw(&mut self) {
         self.rotation = (self.rotation + 90) % 360;
         self.surface = None;
-        self.render_stage = RenderStage::Preview;
     }
 
     pub fn rotate_ccw(&mut self) {
         self.rotation = (self.rotation + 270) % 360;
         self.surface = None;
-        self.render_stage = RenderStage::Preview;
     }
 
     pub fn rotation(&self) -> i32 {
@@ -295,13 +243,11 @@ impl ImageViewer {
     pub fn flip_horizontal(&mut self) {
         self.flip_h = !self.flip_h;
         self.surface = None;
-        self.render_stage = RenderStage::Preview;
     }
 
     pub fn flip_vertical(&mut self) {
         self.flip_v = !self.flip_v;
         self.surface = None;
-        self.render_stage = RenderStage::Preview;
     }
 
     pub fn is_flipped_h(&self) -> bool {

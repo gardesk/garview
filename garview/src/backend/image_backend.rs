@@ -183,12 +183,12 @@ impl Backend for ImageBackend {
         let orig_width = img.width();
         let orig_height = img.height();
 
-        // Scale if needed
-        if (scale - 1.0).abs() > 0.001 {
+        // Only resize if scaling UP (zooming in past 100%)
+        // For scale <= 1.0, return original and let Cairo handle downscaling (much faster)
+        if scale > 1.001 {
             let new_width = (orig_width as f64 * scale).round() as u32;
             let new_height = (orig_height as f64 * scale).round() as u32;
 
-            // Use fast bilinear filter for snappy rendering
             let resized =
                 img.resize_exact(new_width, new_height, image::imageops::FilterType::Triangle);
 
@@ -200,6 +200,7 @@ impl Backend for ImageBackend {
                 index,
             })
         } else {
+            // Return original size - Cairo will scale down for display
             let rgba = img.to_rgba8();
             Ok(RenderedPage {
                 data: rgba.into_raw(),
