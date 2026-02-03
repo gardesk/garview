@@ -3,7 +3,29 @@ use crate::backend::{backend_for_path, Backend, PageSize};
 use anyhow::{anyhow, Result};
 use gartk_render::Surface;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Loading state for async image loading
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LoadState {
+    /// No image loaded
+    Empty,
+    /// Image is being decoded in background
+    Loading,
+    /// Image is ready to display
+    Ready,
+    /// Loading failed
+    Failed,
+}
+
+/// Result from background loading thread
+struct LoadResult {
+    backend: Box<dyn Backend>,
+    size: PageSize,
+    path: PathBuf,
+}
 
 pub struct ImageViewer {
     /// Current backend
@@ -32,6 +54,14 @@ pub struct ImageViewer {
     /// Directory listing for prev/next
     directory_files: Vec<PathBuf>,
     current_index: usize,
+    /// Async loading state
+    load_state: LoadState,
+    /// Channel to receive loaded image from background thread
+    load_receiver: Option<Receiver<Result<LoadResult>>>,
+    /// Handle to background loading thread
+    load_handle: Option<JoinHandle<()>>,
+    /// Time loading started (for minimum display time)
+    load_start: Option<Instant>,
 }
 
 impl ImageViewer {
@@ -51,35 +81,132 @@ impl ImageViewer {
             last_frame_time: Instant::now(),
             directory_files: Vec::new(),
             current_index: 0,
+            load_state: LoadState::Empty,
+            load_receiver: None,
+            load_handle: None,
+            load_start: None,
         }
     }
 
+    /// Start loading an image asynchronously
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        // Get backend for this file type
+        // Cancel any in-progress load
+        self.cancel_load();
+
+        // Scan directory for siblings (this is fast)
+        self.scan_directory(path);
+
+        // Set loading state
+        self.load_state = LoadState::Loading;
+        self.load_start = Some(Instant::now());
+        self.current_path = Some(path.to_path_buf());
+
+        // Clear current image
+        self.backend = None;
+        self.surface = None;
+        self.image_size = None;
+
+        // Spawn background thread to load image
+        let path_owned = path.to_path_buf();
+        let (tx, rx): (Sender<Result<LoadResult>>, Receiver<Result<LoadResult>>) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let result = Self::load_in_background(&path_owned);
+            let _ = tx.send(result);
+        });
+
+        self.load_receiver = Some(rx);
+        self.load_handle = Some(handle);
+
+        Ok(())
+    }
+
+    /// Background loading function (runs in separate thread)
+    fn load_in_background(path: &Path) -> Result<LoadResult> {
         let mut backend =
             backend_for_path(path).ok_or_else(|| anyhow!("Unsupported file format"))?;
 
         backend.open(path)?;
-
         let size = backend.page_size(0)?;
 
-        // Scan directory for siblings
-        self.scan_directory(path);
+        Ok(LoadResult {
+            backend,
+            size,
+            path: path.to_path_buf(),
+        })
+    }
 
-        self.backend = Some(backend);
-        self.current_path = Some(path.to_path_buf());
-        self.image_size = Some(size);
-        self.surface = None;
-        self.surface_scale = 0.0;
-        self.current_frame = 0;
-        self.last_frame_time = Instant::now();
-        self.rotation = 0;
-        self.flip_h = false;
-        self.flip_v = false;
-        self.scroll.reset();
-        self.zoom.zoom_fit();
+    /// Cancel any in-progress load
+    fn cancel_load(&mut self) {
+        self.load_receiver = None;
+        if let Some(handle) = self.load_handle.take() {
+            // Don't wait for thread, just drop the handle
+            drop(handle);
+        }
+    }
 
-        Ok(())
+    /// Poll for load completion - call this every frame
+    /// Returns true if state changed (needs redraw)
+    pub fn poll_load(&mut self) -> bool {
+        if self.load_state != LoadState::Loading {
+            return false;
+        }
+
+        let receiver = match self.load_receiver.as_ref() {
+            Some(rx) => rx,
+            None => return false,
+        };
+
+        // Non-blocking check for result
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                // Success! Apply the loaded image
+                self.backend = Some(result.backend);
+                self.image_size = Some(result.size);
+                self.surface = None;
+                self.surface_scale = 0.0;
+                self.current_frame = 0;
+                self.last_frame_time = Instant::now();
+                self.rotation = 0;
+                self.flip_h = false;
+                self.flip_v = false;
+                self.scroll.reset();
+                self.zoom.zoom_fit();
+                self.load_state = LoadState::Ready;
+                self.load_receiver = None;
+                self.load_handle = None;
+                true
+            }
+            Ok(Err(e)) => {
+                // Loading failed
+                tracing::error!("Failed to load image: {}", e);
+                self.load_state = LoadState::Failed;
+                self.load_receiver = None;
+                self.load_handle = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Still loading
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Thread crashed or was cancelled
+                self.load_state = LoadState::Failed;
+                self.load_receiver = None;
+                self.load_handle = None;
+                true
+            }
+        }
+    }
+
+    /// Get the current loading state
+    pub fn load_state(&self) -> LoadState {
+        self.load_state
+    }
+
+    /// Get loading progress hint (time elapsed)
+    pub fn load_elapsed(&self) -> Option<Duration> {
+        self.load_start.map(|t| t.elapsed())
     }
 
     fn scan_directory(&mut self, path: &Path) {
@@ -164,6 +291,10 @@ impl ImageViewer {
 
     /// Render to a surface at the given scale
     pub fn render(&mut self, scale: f64) -> Result<&Surface> {
+        if self.load_state != LoadState::Ready {
+            return Err(anyhow!("No image ready"));
+        }
+
         // For scale <= 1.0, always render at 1.0 and let Cairo downscale (fast)
         // For scale > 1.0 (zoom in), render at target scale for sharpness
         let render_scale = if scale > 1.0 { scale } else { 1.0 };
@@ -197,6 +328,7 @@ impl ImageViewer {
         let next_index = (self.current_index + 1) % self.directory_files.len();
         if next_index != self.current_index {
             let path = self.directory_files[next_index].clone();
+            self.current_index = next_index;
             self.load(&path)?;
             Ok(true)
         } else {
@@ -217,6 +349,7 @@ impl ImageViewer {
 
         if prev_index != self.current_index {
             let path = self.directory_files[prev_index].clone();
+            self.current_index = prev_index;
             self.load(&path)?;
             Ok(true)
         } else {
@@ -287,6 +420,12 @@ impl ImageViewer {
         } else {
             Some((self.current_index + 1, self.directory_files.len()))
         }
+    }
+}
+
+impl Drop for ImageViewer {
+    fn drop(&mut self) {
+        self.cancel_load();
     }
 }
 

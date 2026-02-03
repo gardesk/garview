@@ -6,7 +6,7 @@ use std::path::Path;
 use x11rb::protocol::xproto::ConnectionExt;
 
 use crate::ui::{StatusBar, STATUS_BAR_HEIGHT};
-use crate::viewer::ImageViewer;
+use crate::viewer::{ImageViewer, LoadState};
 
 /// Main application state
 pub struct App {
@@ -88,6 +88,16 @@ impl App {
                     true // Continue despite error
                 }
             };
+
+            // Poll async image loading
+            if self.viewer.poll_load() {
+                self.needs_redraw = true;
+            }
+
+            // Request continuous redraw while loading (for spinner animation)
+            if self.viewer.load_state() == LoadState::Loading {
+                event_loop.request_redraw();
+            }
 
             // Tick animation
             if self.viewer.is_animated() && self.viewer.tick_animation() {
@@ -330,22 +340,66 @@ impl App {
                 ctx.restore()?;
             }
         } else {
-            // No image loaded - show placeholder
+            // Show loading indicator or placeholder
             let ctx = self.renderer.context()?;
-            ctx.set_source_rgb(0.5, 0.5, 0.5);
             ctx.select_font_face(
                 "sans-serif",
                 gartk_render::cairo::FontSlant::Normal,
                 gartk_render::cairo::FontWeight::Normal,
             );
-            ctx.set_font_size(20.0);
-            let text = "No image loaded. Open a file or drag and drop.";
-            let extents = ctx.text_extents(text)?;
-            ctx.move_to(
-                (size.width as f64 - extents.width()) / 2.0,
-                (viewport_height as f64 + extents.height()) / 2.0,
-            );
-            ctx.show_text(text)?;
+
+            match self.viewer.load_state() {
+                LoadState::Loading => {
+                    // Draw loading spinner
+                    let center_x = size.width as f64 / 2.0;
+                    let center_y = viewport_height as f64 / 2.0;
+                    let radius = 30.0;
+
+                    // Animate spinner based on elapsed time
+                    let elapsed = self.viewer.load_elapsed().unwrap_or_default();
+                    let angle = (elapsed.as_millis() as f64 / 100.0) % (2.0 * std::f64::consts::PI);
+
+                    // Draw spinning arc
+                    ctx.set_source_rgb(0.6, 0.6, 0.6);
+                    ctx.set_line_width(4.0);
+                    ctx.arc(center_x, center_y, radius, angle, angle + 1.5 * std::f64::consts::PI);
+                    ctx.stroke()?;
+
+                    // Draw "Loading..." text below spinner
+                    ctx.set_font_size(14.0);
+                    ctx.set_source_rgb(0.5, 0.5, 0.5);
+                    let text = "Loading...";
+                    let extents = ctx.text_extents(text)?;
+                    ctx.move_to(
+                        center_x - extents.width() / 2.0,
+                        center_y + radius + 30.0,
+                    );
+                    ctx.show_text(text)?;
+                }
+                LoadState::Failed => {
+                    ctx.set_source_rgb(0.8, 0.3, 0.3);
+                    ctx.set_font_size(20.0);
+                    let text = "Failed to load image";
+                    let extents = ctx.text_extents(text)?;
+                    ctx.move_to(
+                        (size.width as f64 - extents.width()) / 2.0,
+                        (viewport_height as f64 + extents.height()) / 2.0,
+                    );
+                    ctx.show_text(text)?;
+                }
+                _ => {
+                    // Empty state - show placeholder
+                    ctx.set_source_rgb(0.5, 0.5, 0.5);
+                    ctx.set_font_size(20.0);
+                    let text = "No image loaded. Open a file or drag and drop.";
+                    let extents = ctx.text_extents(text)?;
+                    ctx.move_to(
+                        (size.width as f64 - extents.width()) / 2.0,
+                        (viewport_height as f64 + extents.height()) / 2.0,
+                    );
+                    ctx.show_text(text)?;
+                }
+            }
         }
 
         // Render status bar
