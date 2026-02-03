@@ -416,19 +416,30 @@ impl Sidebar {
             let y = i as f64 * item_height;
             let indent = entry.level as f64 * 12.0;
 
-            // Selection highlight
+            // Selection highlight (current page)
             if self.selected_page == Some(entry.page) {
                 ctx.set_source_rgba(0.3, 0.5, 0.8, 0.3);
                 ctx.rectangle(0.0, y, self.width as f64, item_height);
                 ctx.fill()?;
             }
 
-            // Entry text
-            ctx.set_source_rgb(0.8, 0.8, 0.8);
+            // Page number on right side
+            let page_label = format!("{}", entry.page + 1);
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            let page_extents = ctx.text_extents(&page_label)?;
+            ctx.move_to(self.width as f64 - page_extents.width() - 8.0, y + 16.0);
+            ctx.show_text(&page_label)?;
+
+            // Entry text (link-like color)
+            if self.selected_page == Some(entry.page) {
+                ctx.set_source_rgb(0.6, 0.8, 1.0); // Lighter blue for selected
+            } else {
+                ctx.set_source_rgb(0.5, 0.7, 0.9); // Link-like blue
+            }
             ctx.move_to(8.0 + indent, y + 16.0);
 
-            // Truncate long titles
-            let max_width = (self.width as f64 - 20.0 - indent) as usize;
+            // Truncate long titles (account for page number)
+            let max_width = (self.width as f64 - 40.0 - indent - page_extents.width()) as usize;
             let title = if entry.title.len() > max_width / 7 {
                 format!("{}...", &entry.title[..max_width / 7])
             } else {
