@@ -11,6 +11,14 @@ pub struct ImageBackend {
     path: Option<PathBuf>,
     frames: Option<Vec<AnimatedFrame>>,
     exif_rotation: u32,
+    /// Cached RGBA data at native resolution
+    rgba_cache: Option<CachedRgba>,
+}
+
+struct CachedRgba {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 struct AnimatedFrame {
@@ -25,6 +33,7 @@ impl ImageBackend {
             path: None,
             frames: None,
             exif_rotation: 1,
+            rgba_cache: None,
         }
     }
 
@@ -139,6 +148,7 @@ impl Backend for ImageBackend {
         self.path = None;
         self.frames = None;
         self.exif_rotation = 1;
+        self.rgba_cache = None;
     }
 
     fn is_open(&self) -> bool {
@@ -171,20 +181,39 @@ impl Backend for ImageBackend {
     }
 
     fn render_page(&mut self, page: usize, scale: f64) -> Result<RenderedPage> {
-        let (img, index) = if let Some(ref frames) = self.frames {
+        // For animated images, don't use the cache (frames are separate)
+        if let Some(ref frames) = self.frames {
             let frame = frames.get(page).ok_or_else(|| anyhow!("Invalid frame"))?;
-            (&frame.image, page)
-        } else if let Some(ref img) = self.image {
-            (img, 0)
-        } else {
-            return Err(anyhow!("No image loaded"));
-        };
+            let img = &frame.image;
 
+            if scale > 1.001 {
+                let new_width = (img.width() as f64 * scale).round() as u32;
+                let new_height = (img.height() as f64 * scale).round() as u32;
+                let resized =
+                    img.resize_exact(new_width, new_height, image::imageops::FilterType::Triangle);
+                let rgba = resized.to_rgba8();
+                return Ok(RenderedPage {
+                    data: rgba.into_raw(),
+                    width: new_width,
+                    height: new_height,
+                    index: page,
+                });
+            } else {
+                let rgba = img.to_rgba8();
+                return Ok(RenderedPage {
+                    data: rgba.into_raw(),
+                    width: img.width(),
+                    height: img.height(),
+                    index: page,
+                });
+            }
+        }
+
+        let img = self.image.as_ref().ok_or_else(|| anyhow!("No image loaded"))?;
         let orig_width = img.width();
         let orig_height = img.height();
 
-        // Only resize if scaling UP (zooming in past 100%)
-        // For scale <= 1.0, return original and let Cairo handle downscaling (much faster)
+        // For scale > 1.0, resize from cached RGBA (or original if no cache)
         if scale > 1.001 {
             let new_width = (orig_width as f64 * scale).round() as u32;
             let new_height = (orig_height as f64 * scale).round() as u32;
@@ -197,16 +226,26 @@ impl Backend for ImageBackend {
                 data: rgba.into_raw(),
                 width: new_width,
                 height: new_height,
-                index,
+                index: 0,
             })
         } else {
-            // Return original size - Cairo will scale down for display
-            let rgba = img.to_rgba8();
+            // For scale <= 1.0, use cached RGBA data
+            // This avoids expensive to_rgba8() conversion on every call
+            if self.rgba_cache.is_none() {
+                let rgba = img.to_rgba8();
+                self.rgba_cache = Some(CachedRgba {
+                    data: rgba.into_raw(),
+                    width: orig_width,
+                    height: orig_height,
+                });
+            }
+
+            let cache = self.rgba_cache.as_ref().unwrap();
             Ok(RenderedPage {
-                data: rgba.into_raw(),
-                width: orig_width,
-                height: orig_height,
-                index,
+                data: cache.data.clone(),
+                width: cache.width,
+                height: cache.height,
+                index: 0,
             })
         }
     }

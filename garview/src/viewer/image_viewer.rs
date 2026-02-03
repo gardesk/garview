@@ -345,15 +345,19 @@ impl ImageViewer {
             return Err(anyhow!("No image ready"));
         }
 
-        // For scale <= 1.0, always render at 1.0 and let Cairo downscale (fast)
-        // For scale > 1.0 (zoom in), render at target scale for sharpness
-        // Cap at 2.0 to avoid creating massive surfaces - Cairo will upscale beyond that
-        let render_scale = if scale > 1.0 { scale.min(2.0) } else { 1.0 };
+        // Always render at native resolution (1.0) - Cairo handles all scaling
+        // This avoids expensive resize operations entirely
+        // Quality is fine since at high zoom you're looking at individual pixels anyway
+        let render_scale = 1.0;
 
         // Check if we need to re-render
         let needs_render = self.surface.is_none() || (self.surface_scale - render_scale).abs() > 0.001;
 
         if needs_render {
+            tracing::debug!(
+                "Re-rendering surface: scale={:.2}, render_scale={:.2}, cached_scale={:.2}",
+                scale, render_scale, self.surface_scale
+            );
             let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No image loaded"))?;
             let page = backend.render_page(self.current_frame, render_scale)?;
             let surface = Surface::from_rgba(&page.data, page.width, page.height)?;

@@ -641,6 +641,11 @@ impl App {
                 let ctx = self.renderer.context()?;
 
                 ctx.save()?;
+
+                // Clip to viewport - critical for performance when zoomed in
+                ctx.rectangle(0.0, 0.0, size.width as f64, viewport_height as f64);
+                ctx.clip();
+
                 ctx.translate(x, y);
 
                 // Apply rotation and flip around center
@@ -663,10 +668,15 @@ impl App {
                 // Scale surface to display size
                 ctx.scale(display_scale, display_scale);
 
-                // Paint the image surface with good filtering
+                // Paint the image surface
                 ctx.set_source_surface(image_surface.cairo_surface(), 0.0, 0.0)?;
-                // Use GOOD filter for smooth scaling
-                ctx.source().set_filter(gartk_render::cairo::Filter::Bilinear);
+                // Use NEAREST at high zoom (looking at pixels anyway), Bilinear otherwise
+                let filter = if display_scale > 2.0 {
+                    gartk_render::cairo::Filter::Nearest
+                } else {
+                    gartk_render::cairo::Filter::Bilinear
+                };
+                ctx.source().set_filter(filter);
                 ctx.paint()?;
 
                 ctx.restore()?;
