@@ -122,6 +122,21 @@ impl Sidebar {
         self.scroll_y = (self.scroll_y + delta_y).clamp(0.0, max_scroll);
     }
 
+    /// Scroll to show a specific page in the thumbnail view
+    pub fn scroll_to_page(&mut self, page: usize, viewport_height: u32) {
+        let item_height = (THUMBNAIL_HEIGHT + THUMBNAIL_PADDING) as f64;
+        let page_y = page as f64 * item_height;
+        let available_height = viewport_height.saturating_sub(TAB_BAR_HEIGHT) as f64;
+
+        // Center the page in the viewport if possible
+        let target_scroll = (page_y - available_height / 2.0 + item_height / 2.0).max(0.0);
+
+        let content_height = (self.page_count as u32 * (THUMBNAIL_HEIGHT + THUMBNAIL_PADDING)) as f64;
+        let max_scroll = (content_height - available_height).max(0.0);
+
+        self.scroll_y = target_scroll.min(max_scroll);
+    }
+
     /// Handle click at position, returns page number if a page was clicked
     pub fn handle_click(&mut self, x: f64, y: f64) -> Option<usize> {
         if !self.visible || x > self.width as f64 {
@@ -342,9 +357,14 @@ impl Sidebar {
                 ctx.restore()?;
             }
 
-            // Border
-            ctx.set_source_rgb(0.5, 0.5, 0.5);
-            ctx.set_line_width(1.0);
+            // Border - highlight selected/active page with blue border
+            if self.selected_page == Some(page) {
+                ctx.set_source_rgb(0.3, 0.6, 1.0);
+                ctx.set_line_width(3.0);
+            } else {
+                ctx.set_source_rgb(0.5, 0.5, 0.5);
+                ctx.set_line_width(1.0);
+            }
             ctx.rectangle(thumb_x, y, thumb_width as f64, THUMBNAIL_HEIGHT as f64);
             ctx.stroke()?;
 
