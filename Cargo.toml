@@ -26,6 +26,8 @@ resvg = "0.44"
 # PDF
 poppler-rs = "0.24"
 cairo-rs = { version = "0.20", features = ["png"] }
+pango = "0.20"
+pangocairo = "0.20"
 
 # Async
 tokio = { version = "1", features = ["rt", "fs", "sync"] }
@@ -60,3 +62,11 @@ arboard = "3.4"
 
 # Open URLs/files
 open = "5.3"
+
+# Comic archives
+zip = "2.2"
+tar = "0.4"
+sevenz-rust = "0.6"
+
+# Ebooks
+epub = "2.1"

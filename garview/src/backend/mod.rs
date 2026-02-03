@@ -1,7 +1,11 @@
+mod comic;
+mod epub;
 mod image_backend;
 mod pdf;
 mod svg;
 
+pub use comic::ComicBackend;
+pub use epub::EpubBackend;
 pub use image_backend::ImageBackend;
 pub use pdf::PdfBackend;
 pub use svg::SvgBackend;
@@ -148,6 +152,16 @@ pub fn backend_for_path(path: &Path) -> Option<Box<dyn Backend>> {
         return Some(Box::new(SvgBackend::new()));
     }
 
+    // Comic archives
+    if ext == "cbz" || ext == "cb7" || ext == "cbt" {
+        return Some(Box::new(ComicBackend::new()));
+    }
+
+    // Ebooks
+    if ext == "epub" {
+        return Some(Box::new(EpubBackend::new()));
+    }
+
     // Images
     let image_exts = [
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico", "avif", "qoi", "ppm",
@@ -178,6 +192,14 @@ pub fn sendable_backend_for_path(path: &Path) -> Option<Box<dyn Backend + Send>>
     if ext == "svg" || ext == "svgz" {
         return Some(Box::new(SvgBackend::new()));
     }
+
+    // Comic archives
+    if ext == "cbz" || ext == "cb7" || ext == "cbt" {
+        return Some(Box::new(ComicBackend::new()));
+    }
+
+    // Ebooks (EpubBackend uses Cairo which is not Send)
+    // Skip EPUB in sendable backend
 
     // Images
     let image_exts = [

@@ -12,6 +12,8 @@ image.workspace = true
 resvg.workspace = true
 poppler-rs.workspace = true
 cairo-rs.workspace = true
+pango.workspace = true
+pangocairo.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -24,3 +26,11 @@ infer.workspace = true
 kamadak-exif.workspace = true
 dirs.workspace = true
 open.workspace = true
+
+# Comic archives
+zip.workspace = true
+tar.workspace = true
+sevenz-rust.workspace = true
+
+# Ebooks
+epub.workspace = true

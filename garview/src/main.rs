@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod annotate;
 mod app;
 mod backend;
 mod cache;
