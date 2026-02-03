@@ -300,16 +300,83 @@ impl Backend for PdfBackend {
     }
 
     fn supports_links(&self) -> bool {
-        // TODO: poppler-rs LinkMapping bindings don't fully expose the fields
-        // needed to extract link destinations. This would require FFI work.
-        // For now, links are detected but not extracted.
-        false
+        self.document.is_some()
     }
 
-    fn get_links(&self, _page: usize) -> Vec<((f64, f64, f64, f64), LinkDestination)> {
-        // TODO: Implement when poppler-rs provides better LinkMapping accessors
-        // The link_mapping() call works, but accessing the action and area
-        // fields requires unsafe FFI code through poppler-sys
-        Vec::new()
+    fn get_links(&self, page: usize) -> Vec<((f64, f64, f64, f64), LinkDestination)> {
+        let p = match self.get_page(page) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+
+        let link_mappings = p.link_mapping();
+        let mut links = Vec::new();
+
+        for mapping in link_mappings {
+            unsafe {
+                let mapping_ptr: *mut ffi::PopplerLinkMapping = mapping.to_glib_none().0;
+                if mapping_ptr.is_null() {
+                    continue;
+                }
+
+                let mapping_ffi = &*mapping_ptr;
+
+                // Get the area rectangle
+                let area = (
+                    mapping_ffi.area.x1,
+                    mapping_ffi.area.y1,
+                    mapping_ffi.area.x2,
+                    mapping_ffi.area.y2,
+                );
+
+                // Get the action
+                let action_ptr = mapping_ffi.action;
+                if action_ptr.is_null() {
+                    continue;
+                }
+
+                let action_any = &*(action_ptr as *const ffi::PopplerActionAny);
+
+                let dest = if action_any.type_ == ffi::POPPLER_ACTION_GOTO_DEST {
+                    // Internal link to a page
+                    let goto_dest = &*(action_ptr as *const ffi::PopplerActionGotoDest);
+                    if !goto_dest.dest.is_null() {
+                        let dest = &*goto_dest.dest;
+                        // poppler uses 1-based page numbers, we use 0-based
+                        Some(LinkDestination::Page((dest.page_num.max(1) - 1) as usize))
+                    } else {
+                        None
+                    }
+                } else if action_any.type_ == ffi::POPPLER_ACTION_URI {
+                    // External URI link
+                    let uri_action = &*(action_ptr as *const ffi::PopplerActionUri);
+                    if !uri_action.uri.is_null() {
+                        let uri = CStr::from_ptr(uri_action.uri).to_string_lossy().into_owned();
+                        Some(LinkDestination::Uri(uri))
+                    } else {
+                        None
+                    }
+                } else if action_any.type_ == ffi::POPPLER_ACTION_NAMED {
+                    // Named destination
+                    let named_action = &*(action_ptr as *const ffi::PopplerActionNamed);
+                    if !named_action.named_dest.is_null() {
+                        let name = CStr::from_ptr(named_action.named_dest)
+                            .to_string_lossy()
+                            .into_owned();
+                        Some(LinkDestination::Named(name))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(dest) = dest {
+                    links.push((area, dest));
+                }
+            }
+        }
+
+        links
     }
 }
