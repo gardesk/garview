@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
@@ -7,7 +8,8 @@ use std::time::{Duration, Instant};
 use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
 use crate::config::Config;
-use crate::ui::{StatusBar, STATUS_BAR_HEIGHT};
+use crate::ui::{Sidebar, StatusBar, ThumbnailData, STATUS_BAR_HEIGHT, SIDEBAR_WIDTH};
+use crate::backend::LinkDestination;
 use crate::viewer::{GalleryView, ImageViewer, LoadState, SortOrder};
 
 /// Current view mode
@@ -46,10 +48,17 @@ pub struct App {
     mode: ViewMode,
     slideshow: SlideshowState,
     statusbar: StatusBar,
+    sidebar: Sidebar,
     #[allow(dead_code)]
     config: Config,
     fullscreen: bool,
     needs_redraw: bool,
+    /// Search mode active
+    search_active: bool,
+    /// Current search input
+    search_input: String,
+    /// Text selection in progress
+    selecting_text: bool,
 }
 
 impl App {
@@ -81,6 +90,7 @@ impl App {
                 .context("Failed to create renderer")?;
 
         let statusbar = StatusBar::new(theme);
+        let sidebar = Sidebar::new();
         let mut viewer = ImageViewer::new();
         let mut gallery: Option<GalleryView> = None;
         let mut mode = ViewMode::Image;
@@ -132,9 +142,13 @@ impl App {
             mode,
             slideshow: slideshow_state,
             statusbar,
+            sidebar,
             config,
             fullscreen,
             needs_redraw: true,
+            search_active: false,
+            search_input: String::new(),
+            selecting_text: false,
         })
     }
 
@@ -237,18 +251,105 @@ impl App {
             }
 
             InputEvent::Key(key_event) if key_event.pressed => {
+                // Handle search input mode first
+                if self.search_active {
+                    match key_event.key {
+                        Key::Escape => {
+                            self.search_active = false;
+                            self.viewer.clear_search();
+                            self.needs_redraw = true;
+                        }
+                        Key::Return => {
+                            // Execute search
+                            let count = self.viewer.search(&self.search_input);
+                            tracing::info!("Found {} results for '{}'", count, self.search_input);
+                            self.search_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Backspace => {
+                            self.search_input.pop();
+                            self.needs_redraw = true;
+                        }
+                        Key::Char(c) => {
+                            self.search_input.push(c);
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
                 // Global keys
                 match key_event.key {
-                    Key::Escape | Key::Char('q') => return Ok(false),
+                    Key::Escape => {
+                        // Clear selection first, then search, then quit
+                        if self.viewer.selection.text.is_some() || self.viewer.selection.active {
+                            self.viewer.clear_selection();
+                            self.needs_redraw = true;
+                        } else if !self.viewer.search.results.is_empty() {
+                            self.viewer.clear_search();
+                            self.needs_redraw = true;
+                        } else {
+                            return Ok(false); // Quit
+                        }
+                    }
+                    Key::Char('q') => return Ok(false),
+                    // Copy selected text
+                    Key::Char('c') if key_event.modifiers.ctrl => {
+                        if let Some(text) = self.viewer.selected_text() {
+                            if let Err(e) = self.copy_to_clipboard(text) {
+                                tracing::error!("Failed to copy to clipboard: {}", e);
+                            } else {
+                                tracing::info!("Copied {} chars to clipboard", text.len());
+                            }
+                        }
+                        return Ok(true);
+                    }
                     Key::F11 => {
                         if let Err(e) = self.toggle_fullscreen() {
                             tracing::error!("Failed to toggle fullscreen: {}", e);
                         }
                         return Ok(true);
                     }
+                    // Toggle sidebar
+                    Key::F7 => {
+                        self.sidebar.toggle();
+                        // Update sidebar page count when showing
+                        if self.sidebar.visible && self.viewer.is_multipage() {
+                            self.sidebar.set_page_count(self.viewer.page_count());
+                            self.sidebar.selected_page = Some(self.viewer.current_page());
+                            // Generate thumbnails for visible pages
+                            self.generate_sidebar_thumbnails();
+                        }
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
                     Key::Tab | Key::Char('g') => {
                         // Toggle between image and gallery mode
                         self.toggle_view_mode();
+                        return Ok(true);
+                    }
+                    // Search shortcuts
+                    Key::Char('f') if key_event.modifiers.ctrl => {
+                        if self.viewer.supports_search() {
+                            self.search_active = true;
+                            self.search_input.clear();
+                            self.needs_redraw = true;
+                        }
+                        return Ok(true);
+                    }
+                    Key::F3 | Key::Char('n') if !self.viewer.search.results.is_empty() => {
+                        if key_event.modifiers.shift {
+                            self.viewer.search_prev();
+                        } else {
+                            self.viewer.search_next();
+                        }
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
+                    Key::Char('N') if !self.viewer.search.results.is_empty() => {
+                        self.viewer.search_prev();
+                        self.needs_redraw = true;
                         return Ok(true);
                     }
                     _ => {}
@@ -263,24 +364,103 @@ impl App {
 
             InputEvent::MousePress(mouse_event) => {
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
-                    self.viewer.scroll.start_drag(mouse_event.position);
+                    // Check sidebar click first
+                    if self.sidebar.visible {
+                        if let Some(page) = self.sidebar.handle_click(
+                            mouse_event.position.x as f64,
+                            mouse_event.position.y as f64,
+                        ) {
+                            self.viewer.goto_page(page);
+                            self.needs_redraw = true;
+                            return Ok(true);
+                        }
+                        // Click was in sidebar but didn't select a page (tab bar click)
+                        if (mouse_event.position.x as u32) < SIDEBAR_WIDTH {
+                            self.needs_redraw = true;
+                            return Ok(true);
+                        }
+                    }
+
+                    // Check for link click first (without modifiers)
+                    if !mouse_event.modifiers.shift && self.viewer.supports_links() {
+                        if let Some((pdf_x, pdf_y)) = self.screen_to_pdf_coords(
+                            mouse_event.position.x as f64,
+                            mouse_event.position.y as f64,
+                        ) {
+                            if let Some(dest) = self.viewer.link_at_position(pdf_x, pdf_y) {
+                                self.handle_link_click(dest);
+                                return Ok(true);
+                            }
+                        }
+                    }
+
+                    // Check if Shift is held for text selection
+                    if mouse_event.modifiers.shift && self.viewer.supports_text_selection() {
+                        // Start text selection (use image coords, not PDF coords)
+                        if let Some((img_x, img_y)) = self.screen_to_image_coords(
+                            mouse_event.position.x as f64,
+                            mouse_event.position.y as f64,
+                        ) {
+                            self.viewer.start_selection(img_x, img_y);
+                            self.selecting_text = true;
+                            self.needs_redraw = true;
+                        }
+                    } else {
+                        // Normal pan/drag
+                        self.viewer.scroll.start_drag(mouse_event.position);
+                    }
                 }
             }
 
             InputEvent::MouseRelease(mouse_event) => {
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
-                    self.viewer.scroll.end_drag();
+                    if self.selecting_text {
+                        // End text selection
+                        if let Some(text) = self.viewer.end_selection() {
+                            if !text.trim().is_empty() {
+                                tracing::info!("Selected text: {} chars", text.len());
+                                // Auto-copy to clipboard
+                                if let Err(e) = self.copy_to_clipboard(&text) {
+                                    tracing::error!("Failed to copy to clipboard: {}", e);
+                                }
+                            }
+                        }
+                        self.selecting_text = false;
+                        self.needs_redraw = true;
+                    } else {
+                        self.viewer.scroll.end_drag();
+                    }
                 }
             }
 
             InputEvent::MouseMove(mouse_event) => {
-                if self.mode == ViewMode::Image && self.viewer.scroll.is_dragging() {
-                    self.viewer.scroll.update_drag(mouse_event.position);
-                    self.needs_redraw = true;
+                if self.mode == ViewMode::Image {
+                    if self.selecting_text {
+                        // Update text selection (use image coords)
+                        if let Some((img_x, img_y)) = self.screen_to_image_coords(
+                            mouse_event.position.x as f64,
+                            mouse_event.position.y as f64,
+                        ) {
+                            self.viewer.update_selection(img_x, img_y);
+                            self.needs_redraw = true;
+                        }
+                    } else if self.viewer.scroll.is_dragging() {
+                        self.viewer.scroll.update_drag(mouse_event.position);
+                        self.needs_redraw = true;
+                    }
                 }
             }
 
             InputEvent::Scroll(scroll_event) => {
+                // Check if scrolling in sidebar
+                if self.sidebar.visible && (scroll_event.position.x as u32) < SIDEBAR_WIDTH {
+                    let size = self.renderer.size();
+                    let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                    self.sidebar.scroll(scroll_event.delta_y as f64 * 30.0, viewport_height);
+                    self.needs_redraw = true;
+                    return Ok(true);
+                }
+
                 match self.mode {
                     ViewMode::Image => {
                         let size = self.renderer.size();
@@ -559,6 +739,120 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Convert screen coordinates to image coordinates
+    /// Returns coordinates where Y increases downward (same as screen)
+    fn screen_to_image_coords(&self, screen_x: f64, screen_y: f64) -> Option<(f64, f64)> {
+        let size = self.renderer.size();
+        let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+
+        let (img_w, img_h) = self.viewer.effective_size()?;
+        let zoom = self.viewer.zoom.level;
+        let scaled_w = img_w * zoom;
+        let scaled_h = img_h * zoom;
+
+        // Calculate image position (same as in render_single_page)
+        let x = if scaled_w < size.width as f64 {
+            (size.width as f64 - scaled_w) / 2.0
+        } else {
+            -self.viewer.scroll.offset_x
+        };
+
+        let y = if scaled_h < viewport_height as f64 {
+            (viewport_height as f64 - scaled_h) / 2.0
+        } else {
+            -self.viewer.scroll.offset_y
+        };
+
+        // Convert screen to image coordinates
+        let img_x = (screen_x - x) / zoom;
+        let img_y = (screen_y - y) / zoom;
+
+        // Check if within image bounds
+        if img_x >= 0.0 && img_x <= img_w && img_y >= 0.0 && img_y <= img_h {
+            Some((img_x, img_y))
+        } else {
+            None
+        }
+    }
+
+    /// Convert screen coordinates to PDF page coordinates (Y inverted)
+    /// Used for link detection where PDF uses Y=0 at bottom
+    fn screen_to_pdf_coords(&self, screen_x: f64, screen_y: f64) -> Option<(f64, f64)> {
+        let (img_x, img_y) = self.screen_to_image_coords(screen_x, screen_y)?;
+
+        // Convert to PDF coordinates (Y is inverted)
+        let page_size = self.viewer.page_size_for(self.viewer.current_page())?;
+        let pdf_y = page_size.height - img_y;
+        Some((img_x, pdf_y))
+    }
+
+    /// Copy text to clipboard
+    fn copy_to_clipboard(&self, text: &str) -> Result<()> {
+        let mut clipboard = Clipboard::new().context("Failed to access clipboard")?;
+        clipboard.set_text(text).context("Failed to set clipboard text")?;
+        Ok(())
+    }
+
+    /// Handle a link click
+    fn handle_link_click(&mut self, dest: LinkDestination) {
+        match dest {
+            LinkDestination::Page(page) => {
+                // Navigate to page
+                if self.viewer.goto_page(page) {
+                    self.needs_redraw = true;
+                    // Update sidebar selection
+                    if self.sidebar.visible {
+                        self.sidebar.selected_page = Some(page);
+                    }
+                }
+            }
+            LinkDestination::Uri(uri) => {
+                // Open external URI
+                tracing::info!("Opening URI: {}", uri);
+                if let Err(e) = open::that(&uri) {
+                    tracing::error!("Failed to open URI {}: {}", uri, e);
+                }
+            }
+            LinkDestination::Named(name) => {
+                // Named destination - would need to resolve via document
+                tracing::debug!("Named destination not yet supported: {}", name);
+            }
+        }
+    }
+
+    /// Generate thumbnails for the sidebar
+    fn generate_sidebar_thumbnails(&mut self) {
+        let page_count = self.viewer.page_count();
+        const THUMB_SIZE: u32 = 180;
+
+        // Generate thumbnails for all pages (could be optimized to only visible)
+        for page in 0..page_count {
+            if self.sidebar.thumbnails.contains_key(&page) {
+                continue;
+            }
+
+            // Get page size to calculate scale
+            if let Some(page_size) = self.viewer.page_size_for(page) {
+                let scale = (THUMB_SIZE as f64 / page_size.width)
+                    .min(THUMB_SIZE as f64 / page_size.height);
+
+                let thumb_w = (page_size.width * scale) as u32;
+                let thumb_h = (page_size.height * scale) as u32;
+
+                // Render page directly at thumbnail scale using backend
+                if let Some(backend) = &mut self.viewer.backend_mut() {
+                    if let Ok(rendered) = backend.render_page(page, scale) {
+                        self.sidebar.add_thumbnail(page, ThumbnailData {
+                            width: thumb_w.min(rendered.width),
+                            height: thumb_h.min(rendered.height),
+                            data: rendered.data,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Toggle fullscreen mode via EWMH _NET_WM_STATE
     fn toggle_fullscreen(&mut self) -> Result<()> {
         let conn = self.window.connection();
@@ -630,6 +924,19 @@ impl App {
             zoom_mode,
             position,
         )?;
+
+        // Render sidebar if visible
+        if self.sidebar.visible {
+            self.sidebar.render(&self.renderer, viewport_height)?;
+        }
+
+        // Render search bar if active
+        if self.search_active {
+            self.render_search_bar(size.width)?;
+        } else if !self.viewer.search.results.is_empty() {
+            // Show search result position indicator
+            self.render_search_status(size.width)?;
+        }
 
         // Copy to window
         self.renderer.flush();
@@ -746,6 +1053,48 @@ impl App {
                 ctx.paint()?;
 
                 ctx.restore()?;
+
+                // Draw search highlights if any
+                let current_page = self.viewer.current_page();
+                let search_rects = self.viewer.search_results_for_page(current_page);
+                if !search_rects.is_empty() {
+                    self.render_search_highlights(
+                        &search_rects,
+                        current_page,
+                        x,
+                        y,
+                        zoom,
+                        scaled_w,
+                        scaled_h,
+                        rotation,
+                        flip_h,
+                        flip_v,
+                        size.width as f64,
+                        viewport_height as f64,
+                    )?;
+                }
+
+                // Draw text selection highlight
+                if let Some((sel_page, sel_x1, sel_y1, sel_x2, sel_y2)) = self.viewer.selection_rect() {
+                    if sel_page == current_page {
+                        self.render_selection_highlight(
+                            sel_x1,
+                            sel_y1,
+                            sel_x2,
+                            sel_y2,
+                            x,
+                            y,
+                            zoom,
+                            scaled_w,
+                            scaled_h,
+                            rotation,
+                            flip_h,
+                            flip_v,
+                            size.width as f64,
+                            viewport_height as f64,
+                        )?;
+                    }
+                }
             }
             return Ok(());
         }
@@ -804,6 +1153,39 @@ impl App {
                         ctx.source().set_filter(gartk_render::cairo::Filter::Bilinear);
                         ctx.paint()?;
                         ctx.restore()?;
+
+                        // Draw search highlights for this page
+                        let search_rects = self.viewer.search_results_for_page(page_idx);
+                        if !search_rects.is_empty() {
+                            if let Some(ps) = self.viewer.page_size_for(page_idx) {
+                                ctx.save()?;
+                                ctx.translate(page_x, page_y);
+
+                                for (i, (x1, y1, x2, y2)) in search_rects.iter().enumerate() {
+                                    // Convert PDF coordinates to screen
+                                    let screen_y1 = ps.height - y2;
+                                    let screen_y2 = ps.height - y1;
+
+                                    let rect_x = x1 * zoom;
+                                    let rect_y = screen_y1 * zoom;
+                                    let rect_w = (x2 - x1) * zoom;
+                                    let rect_h = (screen_y2 - screen_y1) * zoom;
+
+                                    let is_current = self.viewer.is_current_search_result(page_idx, i);
+
+                                    if is_current {
+                                        ctx.set_source_rgba(1.0, 0.6, 0.0, 0.5);
+                                    } else {
+                                        ctx.set_source_rgba(1.0, 1.0, 0.0, 0.3);
+                                    }
+
+                                    ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+                                    ctx.fill()?;
+                                }
+
+                                ctx.restore()?;
+                            }
+                        }
                     }
                 }
             }
@@ -876,6 +1258,266 @@ impl App {
                 );
                 ctx.show_text(text)?;
             }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_search_highlights(
+        &self,
+        search_rects: &[(f64, f64, f64, f64)],
+        page: usize,
+        x: f64,
+        y: f64,
+        zoom: f64,
+        scaled_w: f64,
+        scaled_h: f64,
+        rotation: i32,
+        flip_h: bool,
+        flip_v: bool,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, viewport_width, viewport_height);
+        ctx.clip();
+
+        ctx.translate(x, y);
+
+        // Apply same transformations as the image
+        if rotation != 0 || flip_h || flip_v {
+            ctx.translate(scaled_w / 2.0, scaled_h / 2.0);
+            if rotation != 0 {
+                ctx.rotate(rotation as f64 * std::f64::consts::PI / 180.0);
+            }
+            if flip_h {
+                ctx.scale(-1.0, 1.0);
+            }
+            if flip_v {
+                ctx.scale(1.0, -1.0);
+            }
+            ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
+        }
+
+        // Get page size for coordinate conversion
+        if let Some(page_size) = self.viewer.page_size_for(page) {
+            let page_h = page_size.height;
+
+            for (i, (x1, y1, x2, y2)) in search_rects.iter().enumerate() {
+                // Convert from PDF coordinates (origin bottom-left) to screen
+                // PDF y increases upward, screen y increases downward
+                let screen_y1 = page_h - y2;
+                let screen_y2 = page_h - y1;
+
+                let rect_x = x1 * zoom;
+                let rect_y = screen_y1 * zoom;
+                let rect_w = (x2 - x1) * zoom;
+                let rect_h = (screen_y2 - screen_y1) * zoom;
+
+                // Check if this is the current result
+                let is_current = self.viewer.is_current_search_result(page, i);
+
+                if is_current {
+                    // Current result: orange highlight
+                    ctx.set_source_rgba(1.0, 0.6, 0.0, 0.5);
+                } else {
+                    // Other results: yellow highlight
+                    ctx.set_source_rgba(1.0, 1.0, 0.0, 0.3);
+                }
+
+                ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+                ctx.fill()?;
+            }
+        }
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_selection_highlight(
+        &self,
+        sel_x1: f64,
+        sel_y1: f64,
+        sel_x2: f64,
+        sel_y2: f64,
+        x: f64,
+        y: f64,
+        zoom: f64,
+        scaled_w: f64,
+        scaled_h: f64,
+        rotation: i32,
+        flip_h: bool,
+        flip_v: bool,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, viewport_width, viewport_height);
+        ctx.clip();
+
+        ctx.translate(x, y);
+
+        // Apply same transformations as the image
+        if rotation != 0 || flip_h || flip_v {
+            ctx.translate(scaled_w / 2.0, scaled_h / 2.0);
+            if rotation != 0 {
+                ctx.rotate(rotation as f64 * std::f64::consts::PI / 180.0);
+            }
+            if flip_h {
+                ctx.scale(-1.0, 1.0);
+            }
+            if flip_v {
+                ctx.scale(1.0, -1.0);
+            }
+            ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
+        }
+
+        // Selection coords are already in image space (Y down), just scale by zoom
+        let rect_x = sel_x1 * zoom;
+        let rect_y = sel_y1 * zoom;
+        let rect_w = (sel_x2 - sel_x1) * zoom;
+        let rect_h = (sel_y2 - sel_y1) * zoom;
+
+        // Blue selection highlight
+        ctx.set_source_rgba(0.2, 0.5, 0.9, 0.3);
+        ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+        ctx.fill()?;
+
+        // Selection border
+        ctx.set_source_rgba(0.2, 0.5, 0.9, 0.8);
+        ctx.set_line_width(1.0);
+        ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+        ctx.stroke()?;
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_search_bar(&mut self, width: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        // Search bar dimensions
+        let bar_width = 300.0_f64.min(width as f64 - 40.0);
+        let bar_height = 32.0;
+        let bar_x = (width as f64 - bar_width) / 2.0;
+        let bar_y = 10.0;
+        let padding = 8.0;
+        let radius = 4.0;
+
+        ctx.save()?;
+
+        // Draw background with rounded corners
+        ctx.new_path();
+        ctx.arc(bar_x + radius, bar_y + radius, radius, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(bar_x + bar_width - radius, bar_y + radius, radius, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        ctx.arc(bar_x + bar_width - radius, bar_y + bar_height - radius, radius, 0.0, 0.5 * std::f64::consts::PI);
+        ctx.arc(bar_x + radius, bar_y + bar_height - radius, radius, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+        ctx.close_path();
+
+        // Fill background
+        ctx.set_source_rgba(0.15, 0.15, 0.15, 0.95);
+        ctx.fill_preserve()?;
+
+        // Draw border
+        ctx.set_source_rgb(0.4, 0.4, 0.4);
+        ctx.set_line_width(1.0);
+        ctx.stroke()?;
+
+        // Draw search icon
+        ctx.set_source_rgb(0.6, 0.6, 0.6);
+        ctx.set_line_width(2.0);
+        let icon_x = bar_x + padding + 6.0;
+        let icon_y = bar_y + bar_height / 2.0;
+        ctx.arc(icon_x, icon_y - 2.0, 5.0, 0.0, 2.0 * std::f64::consts::PI);
+        ctx.stroke()?;
+        ctx.move_to(icon_x + 3.5, icon_y + 1.5);
+        ctx.line_to(icon_x + 7.0, icon_y + 5.0);
+        ctx.stroke()?;
+
+        // Draw text
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(14.0);
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+
+        let text_x = bar_x + padding + 20.0;
+        let text_y = bar_y + bar_height / 2.0 + 5.0;
+
+        if self.search_input.is_empty() {
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.move_to(text_x, text_y);
+            ctx.show_text("Search...")?;
+        } else {
+            ctx.move_to(text_x, text_y);
+            ctx.show_text(&self.search_input)?;
+        }
+
+        // Draw cursor
+        let input_extents = ctx.text_extents(&self.search_input)?;
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        ctx.set_line_width(1.0);
+        ctx.move_to(text_x + input_extents.width() + 2.0, bar_y + 8.0);
+        ctx.line_to(text_x + input_extents.width() + 2.0, bar_y + bar_height - 8.0);
+        ctx.stroke()?;
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_search_status(&mut self, width: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        if let Some((current, total)) = self.viewer.search_position() {
+            let text = format!("{}/{}", current, total);
+
+            // Status pill dimensions
+            let padding_h = 12.0;
+            let padding_v = 6.0;
+
+            ctx.select_font_face(
+                "sans-serif",
+                gartk_render::cairo::FontSlant::Normal,
+                gartk_render::cairo::FontWeight::Normal,
+            );
+            ctx.set_font_size(12.0);
+            let extents = ctx.text_extents(&text)?;
+
+            let pill_width = extents.width() + padding_h * 2.0;
+            let pill_height = extents.height() + padding_v * 2.0;
+            let pill_x = width as f64 - pill_width - 10.0;
+            let pill_y = 10.0;
+            let radius = pill_height / 2.0;
+
+            ctx.save()?;
+
+            // Draw pill background
+            ctx.new_path();
+            ctx.arc(pill_x + radius, pill_y + radius, radius, 0.5 * std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+            ctx.arc(pill_x + pill_width - radius, pill_y + radius, radius, 1.5 * std::f64::consts::PI, 0.5 * std::f64::consts::PI);
+            ctx.close_path();
+
+            ctx.set_source_rgba(0.2, 0.4, 0.6, 0.9);
+            ctx.fill()?;
+
+            // Draw text
+            ctx.set_source_rgb(1.0, 1.0, 1.0);
+            ctx.move_to(pill_x + padding_h, pill_y + padding_v + extents.height());
+            ctx.show_text(&text)?;
+
+            ctx.restore()?;
         }
 
         Ok(())

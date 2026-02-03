@@ -54,3 +54,9 @@ kamadak-exif = "0.5"
 
 # Directories
 dirs = "5.0"
+
+# Clipboard
+arboard = "3.4"
+
+# Open URLs/files
+open = "5.3"

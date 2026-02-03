@@ -1,5 +1,5 @@
 use super::{ScrollState, ZoomState};
-use crate::backend::{backend_for_path, sendable_backend_for_path, Backend, PageSize};
+use crate::backend::{backend_for_path, sendable_backend_for_path, Backend, LinkDestination, PageSize};
 use anyhow::{anyhow, Result};
 use gartk_render::Surface;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,39 @@ struct SyncLoadResult {
 /// Gap between pages in continuous mode (pixels)
 const PAGE_GAP: f64 = 20.0;
 
+/// Search result on a page
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub page: usize,
+    pub rect: (f64, f64, f64, f64), // x1, y1, x2, y2 in page coordinates
+}
+
+/// Search state
+#[derive(Debug, Default)]
+pub struct SearchState {
+    /// Current search query
+    pub query: String,
+    /// All search results
+    pub results: Vec<SearchResult>,
+    /// Current result index
+    pub current_index: usize,
+}
+
+/// Text selection state
+#[derive(Debug, Default, Clone)]
+pub struct TextSelection {
+    /// Page where selection started
+    pub page: usize,
+    /// Selection start point in IMAGE coordinates (not PDF - Y increases downward)
+    pub start: (f64, f64),
+    /// Selection end point in IMAGE coordinates
+    pub end: (f64, f64),
+    /// Whether selection is in progress
+    pub active: bool,
+    /// Selected text (computed when selection ends)
+    pub text: Option<String>,
+}
+
 pub struct ImageViewer {
     /// Current backend
     backend: Option<Box<dyn Backend>>,
@@ -88,6 +121,10 @@ pub struct ImageViewer {
     page_surfaces: std::collections::HashMap<usize, Surface>,
     /// Continuous scroll offset (total y offset from top of document)
     continuous_scroll_y: f64,
+    /// Search state
+    pub search: SearchState,
+    /// Text selection state
+    pub selection: TextSelection,
 }
 
 impl ImageViewer {
@@ -114,6 +151,8 @@ impl ImageViewer {
             view_mode: DocumentViewMode::default(),
             page_surfaces: std::collections::HashMap::new(),
             continuous_scroll_y: 0.0,
+            search: SearchState::default(),
+            selection: TextSelection::default(),
         }
     }
 
@@ -315,6 +354,11 @@ impl ImageViewer {
     #[allow(dead_code)]
     pub fn current_path(&self) -> Option<&Path> {
         self.current_path.as_deref()
+    }
+
+    /// Get mutable access to the backend (for thumbnail generation)
+    pub fn backend_mut(&mut self) -> Option<&mut Box<dyn Backend>> {
+        self.backend.as_mut()
     }
 
     #[allow(dead_code)]
@@ -667,6 +711,7 @@ impl ImageViewer {
     }
 
     /// Cycle through view modes
+    #[allow(dead_code)]
     pub fn cycle_view_mode(&mut self) {
         if !self.is_multipage() {
             return;
@@ -817,6 +862,253 @@ impl ImageViewer {
 
         self.page_surfaces.insert(page, surface);
         self.page_surfaces.get(&page).ok_or_else(|| anyhow!("Cache error"))
+    }
+
+    // Search methods
+
+    /// Check if the current backend supports text search
+    pub fn supports_search(&self) -> bool {
+        self.backend.as_ref().map(|b| b.supports_search()).unwrap_or(false)
+    }
+
+    /// Perform a text search across all pages
+    pub fn search(&mut self, query: &str) -> usize {
+        self.search.query = query.to_string();
+        self.search.results.clear();
+        self.search.current_index = 0;
+
+        if query.is_empty() {
+            return 0;
+        }
+
+        let backend = match self.backend.as_ref() {
+            Some(b) if b.supports_search() => b,
+            _ => return 0,
+        };
+
+        let page_count = backend.page_count();
+        for page in 0..page_count {
+            let rects = backend.search_page(page, query);
+            for rect in rects {
+                self.search.results.push(SearchResult { page, rect });
+            }
+        }
+
+        self.search.results.len()
+    }
+
+    /// Go to the next search result
+    pub fn search_next(&mut self) -> bool {
+        if self.search.results.is_empty() {
+            return false;
+        }
+
+        self.search.current_index = (self.search.current_index + 1) % self.search.results.len();
+        self.go_to_search_result()
+    }
+
+    /// Go to the previous search result
+    pub fn search_prev(&mut self) -> bool {
+        if self.search.results.is_empty() {
+            return false;
+        }
+
+        if self.search.current_index == 0 {
+            self.search.current_index = self.search.results.len() - 1;
+        } else {
+            self.search.current_index -= 1;
+        }
+        self.go_to_search_result()
+    }
+
+    /// Navigate to the current search result
+    fn go_to_search_result(&mut self) -> bool {
+        if let Some(result) = self.search.results.get(self.search.current_index) {
+            let page = result.page;
+            if page != self.current_frame {
+                self.goto_page(page);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear search state
+    pub fn clear_search(&mut self) {
+        self.search = SearchState::default();
+    }
+
+    /// Get search results for a specific page (for highlighting)
+    pub fn search_results_for_page(&self, page: usize) -> Vec<(f64, f64, f64, f64)> {
+        self.search
+            .results
+            .iter()
+            .filter(|r| r.page == page)
+            .map(|r| r.rect)
+            .collect()
+    }
+
+    /// Get current search result index and total
+    pub fn search_position(&self) -> Option<(usize, usize)> {
+        if self.search.results.is_empty() {
+            None
+        } else {
+            Some((self.search.current_index + 1, self.search.results.len()))
+        }
+    }
+
+    /// Check if a result at given page and index (within page) is the current one
+    pub fn is_current_search_result(&self, page: usize, page_result_index: usize) -> bool {
+        if let Some(current) = self.search.results.get(self.search.current_index) {
+            if current.page != page {
+                return false;
+            }
+            // Count how many results on this page come before the current one
+            let mut count = 0;
+            for r in &self.search.results[..self.search.current_index] {
+                if r.page == page {
+                    count += 1;
+                }
+            }
+            count == page_result_index
+        } else {
+            false
+        }
+    }
+
+    // Text selection methods
+
+    /// Check if the current backend supports text selection
+    pub fn supports_text_selection(&self) -> bool {
+        self.backend.as_ref().map(|b| b.supports_text_selection()).unwrap_or(false)
+    }
+
+    /// Start text selection at page coordinates
+    pub fn start_selection(&mut self, page_x: f64, page_y: f64) {
+        self.selection = TextSelection {
+            page: self.current_frame,
+            start: (page_x, page_y),
+            end: (page_x, page_y),
+            active: true,
+            text: None,
+        };
+    }
+
+    /// Update text selection endpoint
+    pub fn update_selection(&mut self, page_x: f64, page_y: f64) {
+        if self.selection.active {
+            self.selection.end = (page_x, page_y);
+        }
+    }
+
+    /// End text selection and extract text
+    pub fn end_selection(&mut self) -> Option<String> {
+        if !self.selection.active {
+            return None;
+        }
+        self.selection.active = false;
+
+        // Get the selection rectangle in image coordinates
+        let (x1, y1) = self.selection.start;
+        let (x2, y2) = self.selection.end;
+
+        // Normalize rectangle (ensure x1 < x2, y1 < y2 in image coords)
+        let img_x1 = x1.min(x2);
+        let img_y1 = y1.min(y2);
+        let img_x2 = x1.max(x2);
+        let img_y2 = y1.max(y2);
+
+        // Pass image coordinates directly to poppler's selected_text
+        // Note: poppler's selected_text uses the same coordinate system as rendering
+        // (Y=0 at top), NOT the internal PDF coordinate system (Y=0 at bottom).
+        // This is different from find_text which returns PDF coordinates.
+        let rect = (img_x1, img_y1, img_x2, img_y2);
+
+        tracing::debug!(
+            "Selection: image coords ({:.1},{:.1})-({:.1},{:.1})",
+            img_x1, img_y1, img_x2, img_y2
+        );
+
+        // Extract text from the backend
+        if let Some(backend) = self.backend.as_ref() {
+            // Log page size from backend for debugging
+            if let Ok(ps) = backend.page_size(self.selection.page) {
+                tracing::debug!("Backend page size: {:.1} x {:.1}", ps.width, ps.height);
+            }
+
+            let text = backend.get_text_for_area(self.selection.page, rect);
+            if let Some(ref t) = text {
+                tracing::debug!("Extracted {} chars: '{}'", t.len(), t.chars().take(100).collect::<String>());
+            } else {
+                tracing::debug!("No text extracted from selection area");
+            }
+            self.selection.text = text.clone();
+            text
+        } else {
+            None
+        }
+    }
+
+    /// Clear the current selection
+    pub fn clear_selection(&mut self) {
+        self.selection = TextSelection::default();
+    }
+
+    /// Get the current selection rectangle in IMAGE coordinates (if any)
+    /// Returns (page, x1, y1, x2, y2) where Y increases downward (screen coords)
+    pub fn selection_rect(&self) -> Option<(usize, f64, f64, f64, f64)> {
+        if !self.selection.active && self.selection.text.is_none() {
+            return None;
+        }
+
+        let (x1, y1) = self.selection.start;
+        let (x2, y2) = self.selection.end;
+
+        Some((
+            self.selection.page,
+            x1.min(x2),
+            y1.min(y2),
+            x1.max(x2),
+            y1.max(y2),
+        ))
+    }
+
+    /// Get the selected text
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection.text.as_deref()
+    }
+
+    // Hyperlink methods
+
+    /// Check if the current backend supports links
+    pub fn supports_links(&self) -> bool {
+        self.backend.as_ref().map(|b| b.supports_links()).unwrap_or(false)
+    }
+
+    /// Get link at page coordinates, returns destination if found
+    pub fn link_at_position(&self, page_x: f64, page_y: f64) -> Option<LinkDestination> {
+        let backend = self.backend.as_ref()?;
+        let links = backend.get_links(self.current_frame);
+
+        for ((x1, y1, x2, y2), dest) in links {
+            if page_x >= x1 && page_x <= x2 && page_y >= y1 && page_y <= y2 {
+                return Some(dest);
+            }
+        }
+
+        None
+    }
+
+    /// Get all links for the current page (for rendering highlights)
+    pub fn current_page_links(&self) -> Vec<(f64, f64, f64, f64)> {
+        self.backend
+            .as_ref()
+            .map(|b| b.get_links(self.current_frame))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(rect, _)| rect)
+            .collect()
     }
 }
 

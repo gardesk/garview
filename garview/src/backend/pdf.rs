@@ -1,6 +1,6 @@
-use super::{Backend, PageSize, RenderedPage};
+use super::{Backend, LinkDestination, PageSize, RenderedPage};
 use anyhow::{anyhow, Result};
-use poppler::Document;
+use poppler::{Document, Rectangle, SelectionStyle};
 use std::path::{Path, PathBuf};
 
 pub struct PdfBackend {
@@ -128,5 +128,55 @@ impl Backend for PdfBackend {
             height: height_px as u32,
             index: page,
         })
+    }
+
+    fn supports_search(&self) -> bool {
+        true
+    }
+
+    fn search_page(&self, page: usize, query: &str) -> Vec<(f64, f64, f64, f64)> {
+        let p = match self.get_page(page) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+
+        p.find_text(query)
+            .into_iter()
+            .map(|r| (r.x1(), r.y1(), r.x2(), r.y2()))
+            .collect()
+    }
+
+    fn supports_text_selection(&self) -> bool {
+        true
+    }
+
+    fn get_text_for_area(&self, page: usize, area: (f64, f64, f64, f64)) -> Option<String> {
+        let p = self.get_page(page).ok()?;
+        let (x1, y1, x2, y2) = area;
+
+        // Create a Rectangle for the selection area
+        let mut rect = Rectangle::default();
+        rect.set_x1(x1);
+        rect.set_y1(y1);
+        rect.set_x2(x2);
+        rect.set_y2(y2);
+
+        // Use selected_text with glyph selection style for accurate word selection
+        p.selected_text(SelectionStyle::Glyph, &mut rect)
+            .map(|s| s.to_string())
+    }
+
+    fn supports_links(&self) -> bool {
+        // TODO: poppler-rs LinkMapping bindings don't fully expose the fields
+        // needed to extract link destinations. This would require FFI work.
+        // For now, links are detected but not extracted.
+        false
+    }
+
+    fn get_links(&self, _page: usize) -> Vec<((f64, f64, f64, f64), LinkDestination)> {
+        // TODO: Implement when poppler-rs provides better LinkMapping accessors
+        // The link_mapping() call works, but accessing the action and area
+        // fields requires unsafe FFI code through poppler-sys
+        Vec::new()
     }
 }

@@ -66,6 +66,58 @@ pub trait Backend {
     fn frame_delay(&self, _frame: usize) -> Option<Duration> {
         None
     }
+
+    /// Does this backend support text search?
+    fn supports_search(&self) -> bool {
+        false
+    }
+
+    /// Search for text on a page, returns rectangles (x1, y1, x2, y2) in page coordinates
+    fn search_page(&self, _page: usize, _query: &str) -> Vec<(f64, f64, f64, f64)> {
+        Vec::new()
+    }
+
+    /// Does this backend support text selection?
+    fn supports_text_selection(&self) -> bool {
+        false
+    }
+
+    /// Get text within a rectangle (x1, y1, x2, y2) in page coordinates
+    fn get_text_for_area(&self, _page: usize, _area: (f64, f64, f64, f64)) -> Option<String> {
+        None
+    }
+
+    /// Does this backend have a table of contents?
+    fn has_toc(&self) -> bool {
+        false
+    }
+
+    /// Get table of contents entries (title, page, level)
+    fn get_toc(&self) -> Vec<(String, usize, usize)> {
+        Vec::new()
+    }
+
+    /// Does this backend support hyperlinks?
+    fn supports_links(&self) -> bool {
+        false
+    }
+
+    /// Get links on a page as (rect, destination) where destination is either
+    /// a page number (internal link) or a URL string (external link)
+    fn get_links(&self, _page: usize) -> Vec<((f64, f64, f64, f64), LinkDestination)> {
+        Vec::new()
+    }
+}
+
+/// Link destination type
+#[derive(Debug, Clone)]
+pub enum LinkDestination {
+    /// Internal link to a page number
+    Page(usize),
+    /// External URI
+    Uri(String),
+    /// Named destination (not yet resolved)
+    Named(String),
 }
 
 /// Detect backend for a file based on extension

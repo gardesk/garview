@@ -23,3 +23,5 @@ thiserror.workspace = true
 infer.workspace = true
 kamadak-exif.workspace = true
 dirs.workspace = true
+arboard.workspace = true
+open.workspace = true
