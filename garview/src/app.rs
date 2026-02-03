@@ -412,6 +412,28 @@ impl App {
                 self.needs_redraw = true;
             }
 
+            // Page navigation (for multi-page documents like PDF)
+            Key::PageDown => {
+                if self.viewer.next_page() {
+                    self.needs_redraw = true;
+                }
+            }
+            Key::PageUp => {
+                if self.viewer.prev_page() {
+                    self.needs_redraw = true;
+                }
+            }
+            Key::Home => {
+                if self.viewer.first_page() {
+                    self.needs_redraw = true;
+                }
+            }
+            Key::End => {
+                if self.viewer.last_page() {
+                    self.needs_redraw = true;
+                }
+            }
+
             _ => {}
         }
     }
@@ -559,12 +581,17 @@ impl App {
 
         // Render status bar
         let (file_info, zoom_level, zoom_mode, position) = match self.mode {
-            ViewMode::Image => (
-                self.viewer.file_info(),
-                self.viewer.zoom.level,
-                self.viewer.zoom.mode,
-                self.viewer.directory_position(),
-            ),
+            ViewMode::Image => {
+                // For multi-page documents, show page position; otherwise show directory position
+                let pos = self.viewer.page_position()
+                    .or_else(|| self.viewer.directory_position());
+                (
+                    self.viewer.file_info(),
+                    self.viewer.zoom.level,
+                    self.viewer.zoom.mode,
+                    pos,
+                )
+            }
             ViewMode::Gallery => {
                 let pos = self.gallery.as_ref().map(|g| (g.selection_index() + 1, g.file_count()));
                 (None, 1.0, crate::viewer::ZoomMode::Fit, pos)

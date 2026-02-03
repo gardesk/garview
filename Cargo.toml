@@ -23,6 +23,10 @@ image = { version = "0.25", features = [
 # SVG
 resvg = "0.44"
 
+# PDF
+poppler-rs = "0.24"
+cairo-rs = { version = "0.20", features = ["png"] }
+
 # Async
 tokio = { version = "1", features = ["rt", "fs", "sync"] }
 

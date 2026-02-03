@@ -1,7 +1,9 @@
 mod image_backend;
+mod pdf;
 mod svg;
 
 pub use image_backend::ImageBackend;
+pub use pdf::PdfBackend;
 pub use svg::SvgBackend;
 
 use anyhow::Result;
@@ -30,7 +32,7 @@ pub struct PageSize {
 
 /// Backend trait for format-specific rendering
 #[allow(dead_code)]
-pub trait Backend: Send {
+pub trait Backend {
     /// Get the format name (used for status bar display)
     fn format_name(&self) -> &'static str;
 
@@ -72,6 +74,42 @@ pub fn backend_for_path(path: &Path) -> Option<Box<dyn Backend>> {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())?;
+
+    // PDF
+    if ext == "pdf" {
+        return Some(Box::new(PdfBackend::new()));
+    }
+
+    // SVG
+    if ext == "svg" || ext == "svgz" {
+        return Some(Box::new(SvgBackend::new()));
+    }
+
+    // Images
+    let image_exts = [
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico", "avif", "qoi", "ppm",
+        "pgm", "pbm", "tga", "dds", "exr", "ff", "apng",
+    ];
+
+    if image_exts.contains(&ext.as_str()) {
+        return Some(Box::new(ImageBackend::new()));
+    }
+
+    None
+}
+
+/// Detect backend for a file, returning only Send-safe backends
+/// Used for async loading in background threads
+pub fn sendable_backend_for_path(path: &Path) -> Option<Box<dyn Backend + Send>> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())?;
+
+    // PDF is not Send - skip it here
+    if ext == "pdf" {
+        return None;
+    }
 
     // SVG
     if ext == "svg" || ext == "svgz" {

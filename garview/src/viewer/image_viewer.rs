@@ -1,5 +1,5 @@
 use super::{ScrollState, ZoomState};
-use crate::backend::{backend_for_path, Backend, PageSize};
+use crate::backend::{backend_for_path, sendable_backend_for_path, Backend, PageSize};
 use anyhow::{anyhow, Result};
 use gartk_render::Surface;
 use std::path::{Path, PathBuf};
@@ -20,8 +20,14 @@ pub enum LoadState {
     Failed,
 }
 
-/// Result from background loading thread
+/// Result from background loading thread (requires Send)
 struct LoadResult {
+    backend: Box<dyn Backend + Send>,
+    size: PageSize,
+}
+
+/// Result from synchronous loading (for non-Send backends like PDF)
+struct SyncLoadResult {
     backend: Box<dyn Backend>,
     size: PageSize,
 }
@@ -87,7 +93,7 @@ impl ImageViewer {
         }
     }
 
-    /// Start loading an image asynchronously
+    /// Start loading an image asynchronously (or synchronously for PDFs)
     pub fn load(&mut self, path: &Path) -> Result<()> {
         // Cancel any in-progress load
         self.cancel_load();
@@ -105,6 +111,38 @@ impl ImageViewer {
         self.surface = None;
         self.image_size = None;
 
+        // Check if this is a PDF (load synchronously since poppler isn't Send)
+        let is_pdf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase() == "pdf")
+            .unwrap_or(false);
+
+        if is_pdf {
+            // Load PDF synchronously
+            match Self::load_sync(path) {
+                Ok(result) => {
+                    self.backend = Some(result.backend);
+                    self.image_size = Some(result.size);
+                    self.surface = None;
+                    self.surface_scale = 0.0;
+                    self.current_frame = 0;
+                    self.last_frame_time = Instant::now();
+                    self.rotation = 0;
+                    self.flip_h = false;
+                    self.flip_v = false;
+                    self.scroll.reset();
+                    self.zoom.zoom_fit();
+                    self.load_state = LoadState::Ready;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load PDF: {}", e);
+                    self.load_state = LoadState::Failed;
+                }
+            }
+            return Ok(());
+        }
+
         // Spawn background thread to load image
         let path_owned = path.to_path_buf();
         let (tx, rx): (Sender<Result<LoadResult>>, Receiver<Result<LoadResult>>) = mpsc::channel();
@@ -121,14 +159,26 @@ impl ImageViewer {
     }
 
     /// Background loading function (runs in separate thread)
+    /// Only used for Send backends (images, SVG)
     fn load_in_background(path: &Path) -> Result<LoadResult> {
+        let mut backend =
+            sendable_backend_for_path(path).ok_or_else(|| anyhow!("Unsupported file format"))?;
+
+        backend.open(path)?;
+        let size = backend.page_size(0)?;
+
+        Ok(LoadResult { backend, size })
+    }
+
+    /// Synchronous loading function (for non-Send backends like PDF)
+    fn load_sync(path: &Path) -> Result<SyncLoadResult> {
         let mut backend =
             backend_for_path(path).ok_or_else(|| anyhow!("Unsupported file format"))?;
 
         backend.open(path)?;
         let size = backend.page_size(0)?;
 
-        Ok(LoadResult { backend, size })
+        Ok(SyncLoadResult { backend, size })
     }
 
     /// Cancel any in-progress load
@@ -475,6 +525,94 @@ impl ImageViewer {
             None
         } else {
             Some((self.current_index + 1, self.directory_files.len()))
+        }
+    }
+
+    // Page navigation (for multi-page documents like PDF)
+    /// Get total page count
+    pub fn page_count(&self) -> usize {
+        self.backend.as_ref().map(|b| b.page_count()).unwrap_or(1)
+    }
+
+    /// Get current page (0-indexed)
+    pub fn current_page(&self) -> usize {
+        self.current_frame
+    }
+
+    /// Check if document has multiple pages
+    pub fn is_multipage(&self) -> bool {
+        self.page_count() > 1 && !self.is_animated()
+    }
+
+    /// Go to specific page (0-indexed)
+    pub fn goto_page(&mut self, page: usize) -> bool {
+        let count = self.page_count();
+        if page >= count {
+            return false;
+        }
+        if page != self.current_frame {
+            self.current_frame = page;
+            self.surface = None; // Invalidate cache
+            // Update image size for the new page
+            if let Some(backend) = self.backend.as_ref() {
+                if let Ok(size) = backend.page_size(page) {
+                    self.image_size = Some(size);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Go to next page
+    pub fn next_page(&mut self) -> bool {
+        let count = self.page_count();
+        if count <= 1 || self.is_animated() {
+            return false;
+        }
+        if self.current_frame + 1 < count {
+            self.goto_page(self.current_frame + 1)
+        } else {
+            false
+        }
+    }
+
+    /// Go to previous page
+    pub fn prev_page(&mut self) -> bool {
+        if self.page_count() <= 1 || self.is_animated() {
+            return false;
+        }
+        if self.current_frame > 0 {
+            self.goto_page(self.current_frame - 1)
+        } else {
+            false
+        }
+    }
+
+    /// Go to first page
+    pub fn first_page(&mut self) -> bool {
+        if self.page_count() <= 1 || self.is_animated() {
+            return false;
+        }
+        self.goto_page(0)
+    }
+
+    /// Go to last page
+    pub fn last_page(&mut self) -> bool {
+        let count = self.page_count();
+        if count <= 1 || self.is_animated() {
+            return false;
+        }
+        self.goto_page(count - 1)
+    }
+
+    /// Get page position for status bar display
+    pub fn page_position(&self) -> Option<(usize, usize)> {
+        if self.is_multipage() {
+            Some((self.current_frame + 1, self.page_count()))
+        } else {
+            None
         }
     }
 }
