@@ -465,10 +465,16 @@ impl ImageViewer {
             return Err(anyhow!("No image ready"));
         }
 
-        // Always render at native resolution (1.0) - Cairo handles all scaling
-        // This avoids expensive resize operations entirely
-        // Quality is fine since at high zoom you're looking at individual pixels anyway
-        let render_scale = 1.0;
+        // For PDFs (vector-based), render at the zoom level for sharp text
+        // For images (raster), render at 1.0 since they don't benefit from higher scale
+        let is_pdf = self.backend.as_ref().map(|b| b.format_name() == "PDF").unwrap_or(false);
+        let render_scale = if is_pdf {
+            // Render PDF at zoom level, capped at 4.0 to avoid excessive memory
+            scale.min(4.0).max(1.0)
+        } else {
+            // Images always at native resolution
+            1.0
+        };
 
         // Check if we need to re-render
         let needs_render = self.surface.is_none() || (self.surface_scale - render_scale).abs() > 0.001;
@@ -845,23 +851,38 @@ impl ImageViewer {
     }
 
     /// Render a specific page (used for continuous mode)
-    pub fn render_page_surface(&mut self, page: usize) -> Result<&Surface> {
+    /// Pass zoom level to render PDFs at the correct resolution for sharp text
+    pub fn render_page_surface(&mut self, page: usize, zoom: f64) -> Result<&Surface> {
         if self.load_state != LoadState::Ready {
             return Err(anyhow!("No image ready"));
         }
 
-        // Check cache
-        if self.page_surfaces.contains_key(&page) {
-            return self.page_surfaces.get(&page).ok_or_else(|| anyhow!("Cache error"));
+        let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;
+
+        // For PDFs, render at zoom level for sharp text (capped at 4.0)
+        // For images, use 1.0
+        let is_pdf = backend.format_name() == "PDF";
+        let render_scale = if is_pdf {
+            zoom.min(4.0).max(1.0)
+        } else {
+            1.0
+        };
+
+        // Cache key includes scale for PDFs (rounded to avoid tiny differences)
+        let scale_key = (render_scale * 100.0).round() as i32;
+        let cache_key = page * 10000 + scale_key as usize;
+
+        // Check cache with scale-aware key
+        if self.page_surfaces.contains_key(&cache_key) {
+            return self.page_surfaces.get(&cache_key).ok_or_else(|| anyhow!("Cache error"));
         }
 
-        // Render the page
-        let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;
-        let rendered = backend.render_page(page, 1.0)?;
+        // Render the page at the appropriate scale
+        let rendered = backend.render_page(page, render_scale)?;
         let surface = Surface::from_rgba(&rendered.data, rendered.width, rendered.height)?;
 
-        self.page_surfaces.insert(page, surface);
-        self.page_surfaces.get(&page).ok_or_else(|| anyhow!("Cache error"))
+        self.page_surfaces.insert(cache_key, surface);
+        self.page_surfaces.get(&cache_key).ok_or_else(|| anyhow!("Cache error"))
     }
 
     // Search methods
@@ -1077,6 +1098,27 @@ impl ImageViewer {
     /// Get the selected text
     pub fn selected_text(&self) -> Option<&str> {
         self.selection.text.as_deref()
+    }
+
+    /// Get the selection region as a list of rectangles for text-aware highlighting
+    /// Returns (page, Vec<(x, y, width, height)>) in screen coordinates at current zoom
+    pub fn selection_region(&self, zoom: f64) -> Option<(usize, Vec<(i32, i32, i32, i32)>)> {
+        if !self.selection.active && self.selection.text.is_none() {
+            return None;
+        }
+
+        let backend = self.backend.as_ref()?;
+
+        let (x1, y1) = self.selection.start;
+        let (x2, y2) = self.selection.end;
+        let area = (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2));
+
+        let rects = backend.get_selection_region(self.selection.page, area, zoom);
+        if rects.is_empty() {
+            None
+        } else {
+            Some((self.selection.page, rects))
+        }
     }
 
     // Hyperlink methods

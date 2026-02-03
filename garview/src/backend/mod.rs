@@ -87,6 +87,17 @@ pub trait Backend {
         None
     }
 
+    /// Get selection region as a list of rectangles (for text-aware highlighting)
+    /// Returns Vec<(x, y, width, height)> in image coordinates (Y=0 at top)
+    fn get_selection_region(
+        &self,
+        _page: usize,
+        _area: (f64, f64, f64, f64),
+        _scale: f64,
+    ) -> Vec<(i32, i32, i32, i32)> {
+        Vec::new()
+    }
+
     /// Does this backend have a table of contents?
     fn has_toc(&self) -> bool {
         false

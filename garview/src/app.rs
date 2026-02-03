@@ -1075,7 +1075,24 @@ impl App {
                 }
 
                 // Draw text selection highlight
-                if let Some((sel_page, sel_x1, sel_y1, sel_x2, sel_y2)) = self.viewer.selection_rect() {
+                // First try text-aware selection region (proper text highlighting)
+                if let Some((sel_page, rects)) = self.viewer.selection_region(zoom) {
+                    if sel_page == current_page && !rects.is_empty() {
+                        self.render_selection_region(
+                            &rects,
+                            x,
+                            y,
+                            rotation,
+                            flip_h,
+                            flip_v,
+                            scaled_w,
+                            scaled_h,
+                            size.width as f64,
+                            viewport_height as f64,
+                        )?;
+                    }
+                } else if let Some((sel_page, sel_x1, sel_y1, sel_x2, sel_y2)) = self.viewer.selection_rect() {
+                    // Fall back to simple rectangle for non-PDF or if region fails
                     if sel_page == current_page {
                         self.render_selection_highlight(
                             sel_x1,
@@ -1141,8 +1158,8 @@ impl App {
 
                 // Skip if page is off-screen
                 if page_y + page_height >= 0.0 && page_y < viewport_height as f64 {
-                    // Render page surface
-                    if let Ok(surface) = self.viewer.render_page_surface(page_idx) {
+                    // Render page surface at current zoom for sharp PDF text
+                    if let Ok(surface) = self.viewer.render_page_surface(page_idx, zoom) {
                         let surface_w = surface.width() as f64;
                         let display_scale = page_width / surface_w;
 
@@ -1339,6 +1356,59 @@ impl App {
         Ok(())
     }
 
+    /// Render text-aware selection as multiple rectangles (proper text highlighting)
+    #[allow(clippy::too_many_arguments)]
+    fn render_selection_region(
+        &self,
+        rects: &[(i32, i32, i32, i32)],
+        x: f64,
+        y: f64,
+        rotation: i32,
+        flip_h: bool,
+        flip_v: bool,
+        scaled_w: f64,
+        scaled_h: f64,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, viewport_width, viewport_height);
+        ctx.clip();
+
+        ctx.translate(x, y);
+
+        // Apply same transformations as the image
+        if rotation != 0 || flip_h || flip_v {
+            ctx.translate(scaled_w / 2.0, scaled_h / 2.0);
+            if rotation != 0 {
+                ctx.rotate(rotation as f64 * std::f64::consts::PI / 180.0);
+            }
+            if flip_h {
+                ctx.scale(-1.0, 1.0);
+            }
+            if flip_v {
+                ctx.scale(1.0, -1.0);
+            }
+            ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
+        }
+
+        // Render each rectangle from the selection region
+        // These are already in screen coordinates at the current zoom
+        ctx.set_source_rgba(0.2, 0.5, 0.9, 0.3);
+        for &(rx, ry, rw, rh) in rects {
+            ctx.rectangle(rx as f64, ry as f64, rw as f64, rh as f64);
+        }
+        ctx.fill()?;
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    /// Render fallback rubber-band selection (single rectangle)
     #[allow(clippy::too_many_arguments)]
     fn render_selection_highlight(
         &self,
