@@ -4,6 +4,6 @@ mod scroll;
 mod zoom;
 
 pub use gallery::{GalleryView, SortOrder};
-pub use image_viewer::{FileInfo, ImageViewer, LoadState};
+pub use image_viewer::{DocumentViewMode, FileInfo, ImageViewer, LoadState};
 pub use scroll::ScrollState;
 pub use zoom::{ZoomMode, ZoomState};

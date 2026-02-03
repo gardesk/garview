@@ -283,10 +283,11 @@ impl App {
             InputEvent::Scroll(scroll_event) => {
                 match self.mode {
                     ViewMode::Image => {
+                        let size = self.renderer.size();
+                        let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+
                         if scroll_event.modifiers.ctrl {
                             let factor = if scroll_event.delta_y < 0 { 1.1 } else { 0.9 };
-                            let size = self.renderer.size();
-                            let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
                             self.viewer.zoom_at_point(
                                 factor,
                                 scroll_event.position.x as f64,
@@ -295,10 +296,18 @@ impl App {
                                 viewport_height as f64,
                             );
                         } else {
-                            self.viewer.scroll.pan(
-                                scroll_event.delta_x as f64 * 30.0,
-                                scroll_event.delta_y as f64 * 30.0,
-                            );
+                            // Use continuous scroll for continuous view mode
+                            if self.viewer.view_mode() == crate::viewer::DocumentViewMode::Continuous {
+                                self.viewer.scroll_continuous(
+                                    scroll_event.delta_y as f64 * 30.0,
+                                    viewport_height as f64,
+                                );
+                            } else {
+                                self.viewer.scroll.pan(
+                                    scroll_event.delta_x as f64 * 30.0,
+                                    scroll_event.delta_y as f64 * 30.0,
+                                );
+                            }
                         }
                     }
                     ViewMode::Gallery => {
@@ -432,6 +441,20 @@ impl App {
                 if self.viewer.last_page() {
                     self.needs_redraw = true;
                 }
+            }
+
+            // View mode switching (for multi-page documents)
+            Key::Char('1') => {
+                self.viewer.set_view_mode(crate::viewer::DocumentViewMode::SinglePage);
+                self.needs_redraw = true;
+            }
+            Key::Char('2') => {
+                self.viewer.set_view_mode(crate::viewer::DocumentViewMode::Continuous);
+                self.needs_redraw = true;
+            }
+            Key::Char('3') => {
+                self.viewer.set_view_mode(crate::viewer::DocumentViewMode::DualPage);
+                self.needs_redraw = true;
             }
 
             _ => {}
@@ -616,6 +639,22 @@ impl App {
     }
 
     fn render_image(&mut self, viewport_height: u32) -> Result<()> {
+        // Dispatch to appropriate render method based on view mode
+        match self.viewer.view_mode() {
+            crate::viewer::DocumentViewMode::SinglePage => {
+                self.render_single_page(viewport_height)
+            }
+            crate::viewer::DocumentViewMode::Continuous => {
+                self.render_continuous(viewport_height)
+            }
+            crate::viewer::DocumentViewMode::DualPage => {
+                // TODO: Implement dual page view
+                self.render_single_page(viewport_height)
+            }
+        }
+    }
+
+    fn render_single_page(&mut self, viewport_height: u32) -> Result<()> {
         let size = self.renderer.size();
 
         if let Some((img_w, img_h)) = self.viewer.effective_size() {
@@ -708,66 +747,134 @@ impl App {
 
                 ctx.restore()?;
             }
-        } else {
-            // Show loading indicator or placeholder
-            let ctx = self.renderer.context()?;
-            ctx.select_font_face(
-                "sans-serif",
-                gartk_render::cairo::FontSlant::Normal,
-                gartk_render::cairo::FontWeight::Normal,
-            );
+            return Ok(());
+        }
 
-            match self.viewer.load_state() {
-                LoadState::Loading => {
-                    // Draw loading spinner
-                    let center_x = size.width as f64 / 2.0;
-                    let center_y = viewport_height as f64 / 2.0;
-                    let radius = 30.0;
+        // Show loading indicator or placeholder
+        self.render_loading_state(viewport_height)
+    }
 
-                    // Animate spinner based on elapsed time
-                    let elapsed = self.viewer.load_elapsed().unwrap_or_default();
-                    let angle = (elapsed.as_millis() as f64 / 100.0) % (2.0 * std::f64::consts::PI);
+    fn render_continuous(&mut self, viewport_height: u32) -> Result<()> {
+        let size = self.renderer.size();
+        let zoom = self.viewer.zoom.level;
+        let scroll_y = self.viewer.continuous_scroll_y();
 
-                    // Draw spinning arc
-                    ctx.set_source_rgb(0.6, 0.6, 0.6);
-                    ctx.set_line_width(4.0);
-                    ctx.arc(center_x, center_y, radius, angle, angle + 1.5 * std::f64::consts::PI);
-                    ctx.stroke()?;
+        // Get visible pages
+        let (start_page, end_page) = self.viewer.visible_pages(viewport_height as f64, zoom);
 
-                    // Draw "Loading..." text below spinner
-                    ctx.set_font_size(14.0);
-                    ctx.set_source_rgb(0.5, 0.5, 0.5);
-                    let text = "Loading...";
-                    let extents = ctx.text_extents(text)?;
-                    ctx.move_to(
-                        center_x - extents.width() / 2.0,
-                        center_y + radius + 30.0,
-                    );
-                    ctx.show_text(text)?;
+        let ctx = self.renderer.context()?;
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, size.width as f64, viewport_height as f64);
+        ctx.clip();
+
+        // Calculate page gap constant (same as in image_viewer)
+        const PAGE_GAP: f64 = 20.0;
+
+        // Render each visible page
+        let mut y_offset = 0.0;
+        for page_idx in 0..=end_page {
+            // Get page size
+            let page_size = match self.viewer.page_size_for(page_idx) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let page_width = page_size.width * zoom;
+            let page_height = page_size.height * zoom;
+
+            // Only render if page is visible
+            if page_idx >= start_page {
+                // Calculate page position
+                let page_y = y_offset - scroll_y;
+                let page_x = (size.width as f64 - page_width).max(0.0) / 2.0;
+
+                // Skip if page is off-screen
+                if page_y + page_height >= 0.0 && page_y < viewport_height as f64 {
+                    // Render page surface
+                    if let Ok(surface) = self.viewer.render_page_surface(page_idx) {
+                        let surface_w = surface.width() as f64;
+                        let display_scale = page_width / surface_w;
+
+                        ctx.save()?;
+                        ctx.translate(page_x, page_y);
+                        ctx.scale(display_scale, display_scale);
+                        ctx.set_source_surface(surface.cairo_surface(), 0.0, 0.0)?;
+                        ctx.source().set_filter(gartk_render::cairo::Filter::Bilinear);
+                        ctx.paint()?;
+                        ctx.restore()?;
+                    }
                 }
-                LoadState::Failed => {
-                    ctx.set_source_rgb(0.8, 0.3, 0.3);
-                    ctx.set_font_size(20.0);
-                    let text = "Failed to load image";
-                    let extents = ctx.text_extents(text)?;
-                    ctx.move_to(
-                        (size.width as f64 - extents.width()) / 2.0,
-                        (viewport_height as f64 + extents.height()) / 2.0,
-                    );
-                    ctx.show_text(text)?;
-                }
-                _ => {
-                    // Empty state - show placeholder
-                    ctx.set_source_rgb(0.5, 0.5, 0.5);
-                    ctx.set_font_size(20.0);
-                    let text = "No image loaded. Open a file or drag and drop.";
-                    let extents = ctx.text_extents(text)?;
-                    ctx.move_to(
-                        (size.width as f64 - extents.width()) / 2.0,
-                        (viewport_height as f64 + extents.height()) / 2.0,
-                    );
-                    ctx.show_text(text)?;
-                }
+            }
+
+            y_offset += page_height + PAGE_GAP;
+        }
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_loading_state(&mut self, viewport_height: u32) -> Result<()> {
+        let size = self.renderer.size();
+        let ctx = self.renderer.context()?;
+
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+
+        match self.viewer.load_state() {
+            LoadState::Loading => {
+                // Draw loading spinner
+                let center_x = size.width as f64 / 2.0;
+                let center_y = viewport_height as f64 / 2.0;
+                let radius = 30.0;
+
+                // Animate spinner based on elapsed time
+                let elapsed = self.viewer.load_elapsed().unwrap_or_default();
+                let angle = (elapsed.as_millis() as f64 / 100.0) % (2.0 * std::f64::consts::PI);
+
+                // Draw spinning arc
+                ctx.set_source_rgb(0.6, 0.6, 0.6);
+                ctx.set_line_width(4.0);
+                ctx.arc(center_x, center_y, radius, angle, angle + 1.5 * std::f64::consts::PI);
+                ctx.stroke()?;
+
+                // Draw "Loading..." text below spinner
+                ctx.set_font_size(14.0);
+                ctx.set_source_rgb(0.5, 0.5, 0.5);
+                let text = "Loading...";
+                let extents = ctx.text_extents(text)?;
+                ctx.move_to(
+                    center_x - extents.width() / 2.0,
+                    center_y + radius + 30.0,
+                );
+                ctx.show_text(text)?;
+            }
+            LoadState::Failed => {
+                ctx.set_source_rgb(0.8, 0.3, 0.3);
+                ctx.set_font_size(20.0);
+                let text = "Failed to load image";
+                let extents = ctx.text_extents(text)?;
+                ctx.move_to(
+                    (size.width as f64 - extents.width()) / 2.0,
+                    (viewport_height as f64 + extents.height()) / 2.0,
+                );
+                ctx.show_text(text)?;
+            }
+            _ => {
+                // Empty state - show placeholder
+                ctx.set_source_rgb(0.5, 0.5, 0.5);
+                ctx.set_font_size(20.0);
+                let text = "No image loaded. Open a file or drag and drop.";
+                let extents = ctx.text_extents(text)?;
+                ctx.move_to(
+                    (size.width as f64 - extents.width()) / 2.0,
+                    (viewport_height as f64 + extents.height()) / 2.0,
+                );
+                ctx.show_text(text)?;
             }
         }
 

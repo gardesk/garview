@@ -20,6 +20,18 @@ pub enum LoadState {
     Failed,
 }
 
+/// Document view mode for multi-page documents
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DocumentViewMode {
+    /// Single page at a time
+    #[default]
+    SinglePage,
+    /// Continuous vertical scroll
+    Continuous,
+    /// Two pages side by side (book view)
+    DualPage,
+}
+
 /// Result from background loading thread (requires Send)
 struct LoadResult {
     backend: Box<dyn Backend + Send>,
@@ -32,12 +44,15 @@ struct SyncLoadResult {
     size: PageSize,
 }
 
+/// Gap between pages in continuous mode (pixels)
+const PAGE_GAP: f64 = 20.0;
+
 pub struct ImageViewer {
     /// Current backend
     backend: Option<Box<dyn Backend>>,
     /// Current file path
     current_path: Option<PathBuf>,
-    /// Rendered surface (cached)
+    /// Rendered surface (cached) - for single page mode
     surface: Option<Surface>,
     /// Surface scale (for cache invalidation)
     surface_scale: f64,
@@ -53,7 +68,7 @@ pub struct ImageViewer {
     flip_h: bool,
     /// Flip vertical
     flip_v: bool,
-    /// Animation state
+    /// Animation state / current page
     current_frame: usize,
     last_frame_time: Instant,
     /// Directory listing for prev/next
@@ -67,6 +82,12 @@ pub struct ImageViewer {
     load_handle: Option<JoinHandle<()>>,
     /// Time loading started (for minimum display time)
     load_start: Option<Instant>,
+    /// Document view mode (for multi-page documents)
+    view_mode: DocumentViewMode,
+    /// Page surfaces cache (for continuous mode)
+    page_surfaces: std::collections::HashMap<usize, Surface>,
+    /// Continuous scroll offset (total y offset from top of document)
+    continuous_scroll_y: f64,
 }
 
 impl ImageViewer {
@@ -90,6 +111,9 @@ impl ImageViewer {
             load_receiver: None,
             load_handle: None,
             load_start: None,
+            view_mode: DocumentViewMode::default(),
+            page_surfaces: std::collections::HashMap::new(),
+            continuous_scroll_y: 0.0,
         }
     }
 
@@ -110,6 +134,8 @@ impl ImageViewer {
         self.backend = None;
         self.surface = None;
         self.image_size = None;
+        self.page_surfaces.clear();
+        self.continuous_scroll_y = 0.0;
 
         // Check if this is a PDF (load synchronously since poppler isn't Send)
         let is_pdf = path
@@ -614,6 +640,183 @@ impl ImageViewer {
         } else {
             None
         }
+    }
+
+    /// Get page size for a specific page
+    pub fn page_size_for(&self, page: usize) -> Option<crate::backend::PageSize> {
+        self.backend.as_ref()?.page_size(page).ok()
+    }
+
+    // View mode methods (for multi-page documents)
+
+    /// Get current view mode
+    pub fn view_mode(&self) -> DocumentViewMode {
+        self.view_mode
+    }
+
+    /// Set view mode
+    pub fn set_view_mode(&mut self, mode: DocumentViewMode) {
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            self.page_surfaces.clear();
+            // When switching to continuous mode, scroll to current page
+            if mode == DocumentViewMode::Continuous {
+                self.scroll_to_page_continuous(self.current_frame);
+            }
+        }
+    }
+
+    /// Cycle through view modes
+    pub fn cycle_view_mode(&mut self) {
+        if !self.is_multipage() {
+            return;
+        }
+        let new_mode = match self.view_mode {
+            DocumentViewMode::SinglePage => DocumentViewMode::Continuous,
+            DocumentViewMode::Continuous => DocumentViewMode::DualPage,
+            DocumentViewMode::DualPage => DocumentViewMode::SinglePage,
+        };
+        self.set_view_mode(new_mode);
+    }
+
+    /// Calculate total document height for continuous scroll mode
+    pub fn total_document_height(&self, zoom: f64) -> f64 {
+        let count = self.page_count();
+        if count == 0 {
+            return 0.0;
+        }
+
+        let backend = match self.backend.as_ref() {
+            Some(b) => b,
+            None => return 0.0,
+        };
+
+        let mut total = 0.0;
+        for i in 0..count {
+            if let Ok(size) = backend.page_size(i) {
+                total += size.height * zoom;
+            }
+            if i < count - 1 {
+                total += PAGE_GAP;
+            }
+        }
+        total
+    }
+
+    /// Get page Y position in continuous scroll mode
+    fn page_y_position(&self, page: usize, zoom: f64) -> f64 {
+        let backend = match self.backend.as_ref() {
+            Some(b) => b,
+            None => return 0.0,
+        };
+
+        let mut y = 0.0;
+        for i in 0..page {
+            if let Ok(size) = backend.page_size(i) {
+                y += size.height * zoom + PAGE_GAP;
+            }
+        }
+        y
+    }
+
+    /// Scroll to a page in continuous mode
+    fn scroll_to_page_continuous(&mut self, page: usize) {
+        self.continuous_scroll_y = self.page_y_position(page, self.zoom.level);
+    }
+
+    /// Get which page is visible at current scroll position (continuous mode)
+    fn page_at_scroll(&self, zoom: f64) -> usize {
+        let backend = match self.backend.as_ref() {
+            Some(b) => b,
+            None => return 0,
+        };
+
+        let mut y = 0.0;
+        for i in 0..self.page_count() {
+            if let Ok(size) = backend.page_size(i) {
+                let page_height = size.height * zoom;
+                if self.continuous_scroll_y < y + page_height {
+                    return i;
+                }
+                y += page_height + PAGE_GAP;
+            }
+        }
+        self.page_count().saturating_sub(1)
+    }
+
+    /// Get visible pages in continuous mode (returns (start_page, end_page))
+    pub fn visible_pages(&self, viewport_height: f64, zoom: f64) -> (usize, usize) {
+        let backend = match self.backend.as_ref() {
+            Some(b) => b,
+            None => return (0, 0),
+        };
+
+        let mut y = 0.0;
+        let mut start_page = None;
+        let mut end_page = 0;
+
+        for i in 0..self.page_count() {
+            if let Ok(size) = backend.page_size(i) {
+                let page_height = size.height * zoom;
+                let page_top = y;
+                let page_bottom = y + page_height;
+
+                // Check if page is visible
+                if page_bottom > self.continuous_scroll_y
+                    && page_top < self.continuous_scroll_y + viewport_height
+                {
+                    if start_page.is_none() {
+                        start_page = Some(i);
+                    }
+                    end_page = i;
+                }
+
+                y += page_height + PAGE_GAP;
+
+                // Stop if we're past the viewport
+                if page_top > self.continuous_scroll_y + viewport_height {
+                    break;
+                }
+            }
+        }
+
+        (start_page.unwrap_or(0), end_page)
+    }
+
+    /// Scroll in continuous mode
+    pub fn scroll_continuous(&mut self, delta_y: f64, viewport_height: f64) {
+        let total = self.total_document_height(self.zoom.level);
+        let max_scroll = (total - viewport_height).max(0.0);
+
+        self.continuous_scroll_y = (self.continuous_scroll_y + delta_y).clamp(0.0, max_scroll);
+
+        // Update current page based on scroll position
+        self.current_frame = self.page_at_scroll(self.zoom.level);
+    }
+
+    /// Get continuous scroll offset
+    pub fn continuous_scroll_y(&self) -> f64 {
+        self.continuous_scroll_y
+    }
+
+    /// Render a specific page (used for continuous mode)
+    pub fn render_page_surface(&mut self, page: usize) -> Result<&Surface> {
+        if self.load_state != LoadState::Ready {
+            return Err(anyhow!("No image ready"));
+        }
+
+        // Check cache
+        if self.page_surfaces.contains_key(&page) {
+            return self.page_surfaces.get(&page).ok_or_else(|| anyhow!("Cache error"));
+        }
+
+        // Render the page
+        let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;
+        let rendered = backend.render_page(page, 1.0)?;
+        let surface = Surface::from_rgba(&rendered.data, rendered.width, rendered.height)?;
+
+        self.page_surfaces.insert(page, surface);
+        self.page_surfaces.get(&page).ok_or_else(|| anyhow!("Cache error"))
     }
 }
 
