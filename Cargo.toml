@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["garview"]
+# TODO: Add garviewctl and garview-ipc in Sprint 7
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# UI toolkit
+gartk-core = { path = "../gartk/gartk-core" }
+gartk-x11 = { path = "../gartk/gartk-x11" }
+gartk-render = { path = "../gartk/gartk-render" }
+
+# Image decoding
+image = { version = "0.25", features = [
+    "png", "jpeg", "gif", "webp", "bmp", "tiff", "ico",
+    "avif", "qoi", "pnm", "tga", "dds", "exr", "ff"
+]}
+
+# SVG
+resvg = "0.44"
+
+# Async
+tokio = { version = "1", features = ["rt", "fs", "sync"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+anyhow = "1.0"
+thiserror = "2.0"
+
+# MIME detection
+infer = "0.16"
+
+# EXIF
+kamadak-exif = "0.5"
+
+# Directories
+dirs = "5.0"
