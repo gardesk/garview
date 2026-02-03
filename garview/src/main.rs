@@ -5,6 +5,7 @@ mod app;
 mod backend;
 mod cache;
 mod config;
+mod recent;
 mod ui;
 mod viewer;
 

@@ -1174,6 +1174,24 @@ impl ImageViewer {
             .map(|b| b.get_toc())
             .unwrap_or_default()
     }
+
+    /// Get the current page as PNG bytes for clipboard
+    pub fn current_page_png(&mut self) -> Result<Vec<u8>> {
+        let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;
+
+        // Render at 1:1 scale for full quality
+        let page = backend.render_page(self.current_frame, 1.0)?;
+
+        // Convert RGBA to PNG
+        let img = image::RgbaImage::from_raw(page.width, page.height, page.data)
+            .ok_or_else(|| anyhow!("Failed to create image from page data"))?;
+
+        let mut png_data = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png_data);
+        img.write_to(&mut cursor, image::ImageFormat::Png)?;
+
+        Ok(png_data)
+    }
 }
 
 impl Drop for ImageViewer {

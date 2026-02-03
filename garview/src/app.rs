@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
 use crate::config::Config;
+use crate::recent::RecentFiles;
 use crate::ui::{Sidebar, StatusBar, ThumbnailData, STATUS_BAR_HEIGHT, SIDEBAR_WIDTH};
 use crate::backend::LinkDestination;
-use crate::viewer::{GalleryView, ImageViewer, LoadState, SortOrder};
+use crate::viewer::{GalleryView, ImageViewer, LoadState, SortOrder, ZoomMode};
 
 /// Current view mode
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +63,14 @@ pub struct App {
     goto_page_active: bool,
     /// Go to page input
     goto_page_input: String,
+    /// Recent files manager
+    recent_files: RecentFiles,
+    /// Recent files panel active
+    recent_panel_active: bool,
+    /// Selected index in recent panel
+    recent_panel_selected: usize,
+    /// Properties panel active
+    properties_panel_active: bool,
 }
 
 impl App {
@@ -70,6 +79,12 @@ impl App {
         let config = Config::load().unwrap_or_else(|e| {
             tracing::warn!("Failed to load config: {}, using defaults", e);
             Config::default()
+        });
+
+        // Load recent files
+        let recent_files = RecentFiles::load().unwrap_or_else(|e| {
+            tracing::warn!("Failed to load recent files: {}, starting fresh", e);
+            RecentFiles::new()
         });
 
         let conn = Connection::connect(None).context("Failed to connect to X11")?;
@@ -107,11 +122,29 @@ impl App {
         }
 
         // Load initial file or directory if provided
+        let mut recent_files = recent_files; // Make mutable for adding
         if let Some(ref path_str) = path {
             let path = Path::new(path_str);
             if path.is_file() {
                 if let Err(e) = viewer.load(path) {
                     tracing::error!("Failed to load {}: {}", path.display(), e);
+                } else {
+                    // Add to recent files on successful load
+                    recent_files.add(path);
+                    // Save immediately so recent files persist even on abnormal exit
+                    if let Err(e) = recent_files.save() {
+                        tracing::warn!("Failed to save recent files: {}", e);
+                    }
+                    // Restore session state (page, zoom, scroll) if available
+                    if let Some((page, zoom, scroll)) = recent_files.get_session(path) {
+                        if page < viewer.page_count() {
+                            viewer.goto_page(page);
+                        }
+                        viewer.zoom.mode = ZoomMode::Custom(zoom / 100.0);
+                        viewer.zoom.level = zoom / 100.0;
+                        viewer.scroll.offset_x = scroll.0;
+                        viewer.scroll.offset_y = scroll.1;
+                    }
                 }
             } else if path.is_dir() {
                 // Gallery mode
@@ -154,6 +187,10 @@ impl App {
             selecting_text: false,
             goto_page_active: false,
             goto_page_input: String::new(),
+            recent_files,
+            recent_panel_active: path.is_none(), // Auto-show when no file argument
+            recent_panel_selected: 0,
+            properties_panel_active: false,
         })
     }
 
@@ -166,6 +203,11 @@ impl App {
 
         let mut event_loop =
             EventLoop::new(&self.window, event_config).context("Failed to create event loop")?;
+
+        // Enable drag and drop
+        if let Err(e) = event_loop.enable_xdnd() {
+            tracing::warn!("Failed to enable drag and drop: {}", e);
+        }
 
         event_loop.run(|event_loop, event| {
             // Handle event (errors are logged, not propagated)
@@ -204,6 +246,7 @@ impl App {
                         && self.viewer.load_state() == LoadState::Ready
                         && self.slideshow.last_advance.elapsed() >= self.slideshow.interval
                     {
+                        self.save_current_session();
                         if let Err(e) = self.viewer.next_image() {
                             tracing::debug!("Slideshow advance: {}", e);
                         }
@@ -238,12 +281,21 @@ impl App {
             Ok(should_continue)
         })?;
 
+        // Save recent files on exit
+        tracing::debug!("Saving {} recent files", self.recent_files.len());
+        if let Err(e) = self.recent_files.save() {
+            tracing::error!("Failed to save recent files: {}", e);
+        }
+
         Ok(())
     }
 
     fn handle_event(&mut self, event: InputEvent) -> Result<bool> {
         match event {
-            InputEvent::CloseRequested => return Ok(false),
+            InputEvent::CloseRequested => {
+                self.save_current_session();
+                return Ok(false);
+            }
 
             InputEvent::Resize { width, height } => {
                 self.renderer.resize(width, height)?;
@@ -252,6 +304,43 @@ impl App {
             }
 
             InputEvent::Expose => {
+                self.needs_redraw = true;
+            }
+
+            InputEvent::FileDrop(paths) => {
+                // Handle dropped files - open the first valid file
+                for path in paths {
+                    if path.is_file() {
+                        tracing::info!("File dropped: {}", path.display());
+                        self.save_current_session();
+                        if let Err(e) = self.viewer.load(&path) {
+                            tracing::error!("Failed to load dropped file: {}", e);
+                        } else {
+                            self.recent_files.add(&path);
+                            let _ = self.recent_files.save();
+                            self.mode = ViewMode::Image;
+                            self.restore_session(&path);
+                        }
+                        break; // Only open the first file
+                    } else if path.is_dir() {
+                        tracing::info!("Directory dropped: {}", path.display());
+                        // Open in gallery mode
+                        match GalleryView::new() {
+                            Ok(mut gal) => {
+                                if let Err(e) = gal.open(&path) {
+                                    tracing::error!("Failed to open directory: {}", e);
+                                } else {
+                                    self.mode = ViewMode::Gallery;
+                                    self.gallery = Some(gal);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create gallery: {}", e);
+                            }
+                        }
+                        break;
+                    }
+                }
                 self.needs_redraw = true;
             }
 
@@ -277,6 +366,109 @@ impl App {
                         }
                         Key::Char(c) => {
                             self.search_input.push(c);
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
+                // Recent files panel input
+                if self.recent_panel_active {
+                    let total_items = self.recent_files.len() + 1; // +1 for "Open File..."
+                    match key_event.key {
+                        Key::Escape => {
+                            self.recent_panel_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Up | Key::Char('k') => {
+                            if self.recent_panel_selected > 0 {
+                                self.recent_panel_selected -= 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Down | Key::Char('j') => {
+                            if self.recent_panel_selected + 1 < total_items {
+                                self.recent_panel_selected += 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Return => {
+                            tracing::info!("Enter pressed, selected index: {}", self.recent_panel_selected);
+                            if self.recent_panel_selected == 0 {
+                                // "Open File..." selected - launch file dialog
+                                tracing::info!("Opening file dialog...");
+                                self.recent_panel_active = false;
+                                self.needs_redraw = true;
+
+                                match self.open_file_dialog() {
+                                    Ok(Some(path)) => {
+                                        self.save_current_session();
+                                        if let Err(e) = self.viewer.load(&path) {
+                                            tracing::error!("Failed to load file: {}", e);
+                                            // Reopen panel on error
+                                            self.recent_panel_active = true;
+                                        } else {
+                                            self.recent_files.add(&path);
+                                            let _ = self.recent_files.save();
+                                            self.mode = ViewMode::Image;
+                                            self.restore_session(&path);
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // User cancelled - reopen panel
+                                        self.recent_panel_active = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("File dialog error: {}", e);
+                                        self.recent_panel_active = true;
+                                    }
+                                }
+                            } else {
+                                // Open selected recent file (index adjusted by -1)
+                                let file_index = self.recent_panel_selected - 1;
+                                if let Some(entry) = self.recent_files.files().get(file_index) {
+                                    let path = entry.path.clone();
+                                    self.save_current_session();
+                                    if let Err(e) = self.viewer.load(&path) {
+                                        tracing::error!("Failed to load recent file: {}", e);
+                                    } else {
+                                        self.recent_files.add(&path);
+                                        let _ = self.recent_files.save();
+                                        self.mode = ViewMode::Image;
+                                        self.restore_session(&path);
+                                    }
+                                }
+                                self.recent_panel_active = false;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('d') | Key::Backspace => {
+                            // Remove selected from recent (only for actual files, not "Open File...")
+                            if self.recent_panel_selected > 0 {
+                                let file_index = self.recent_panel_selected - 1;
+                                self.recent_files.remove_index(file_index);
+                                // Adjust selection if needed
+                                if self.recent_panel_selected > self.recent_files.len() {
+                                    self.recent_panel_selected = self.recent_files.len().max(1) - 1 + 1;
+                                    // Keep at least at "Open File..." (0) if no files left
+                                    if self.recent_files.is_empty() {
+                                        self.recent_panel_selected = 0;
+                                    }
+                                }
+                            }
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
+                // Properties panel input
+                if self.properties_panel_active {
+                    match key_event.key {
+                        Key::Escape | Key::Return | Key::Char('i') if key_event.modifiers.ctrl => {
+                            self.properties_panel_active = false;
                             self.needs_redraw = true;
                         }
                         _ => {}
@@ -333,18 +525,31 @@ impl App {
                             self.viewer.clear_search();
                             self.needs_redraw = true;
                         } else {
+                            self.save_current_session();
                             return Ok(false); // Quit
                         }
                     }
-                    Key::Char('q') => return Ok(false),
-                    // Copy selected text
-                    Key::Char('c') if key_event.modifiers.ctrl => {
+                    Key::Char('q') => {
+                        self.save_current_session();
+                        return Ok(false);
+                    }
+                    // Copy selected text (Ctrl+C)
+                    Key::Char('c') if key_event.modifiers.ctrl && !key_event.modifiers.shift => {
                         if let Some(text) = self.viewer.selected_text() {
                             if let Err(e) = self.copy_to_clipboard(text) {
                                 tracing::error!("Failed to copy to clipboard: {}", e);
                             } else {
                                 tracing::info!("Copied {} chars to clipboard", text.len());
                             }
+                        }
+                        return Ok(true);
+                    }
+                    // Copy image to clipboard (Ctrl+Shift+C)
+                    Key::Char('C') if key_event.modifiers.ctrl && key_event.modifiers.shift => {
+                        if let Err(e) = self.copy_image_to_clipboard() {
+                            tracing::error!("Failed to copy image to clipboard: {}", e);
+                        } else {
+                            tracing::info!("Copied image to clipboard");
                         }
                         return Ok(true);
                     }
@@ -401,6 +606,19 @@ impl App {
                             self.goto_page_input.clear();
                             self.needs_redraw = true;
                         }
+                        return Ok(true);
+                    }
+                    // Recent files (Ctrl+R)
+                    Key::Char('r') if key_event.modifiers.ctrl => {
+                        self.recent_panel_active = !self.recent_panel_active;
+                        self.recent_panel_selected = 0;
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
+                    // Properties dialog (Ctrl+I)
+                    Key::Char('i') if key_event.modifiers.ctrl => {
+                        self.properties_panel_active = !self.properties_panel_active;
+                        self.needs_redraw = true;
                         return Ok(true);
                     }
                     Key::Tab | Key::Char('g') => {
@@ -652,12 +870,14 @@ impl App {
 
             // Navigation
             Key::Right | Key::Char('n') | Key::Space => {
+                self.save_current_session();
                 if let Err(e) = self.viewer.next_image() {
                     tracing::error!("Failed to load next image: {}", e);
                 }
                 self.needs_redraw = true;
             }
             Key::Left | Key::Char('p') => {
+                self.save_current_session();
                 if let Err(e) = self.viewer.prev_image() {
                     tracing::error!("Failed to load previous image: {}", e);
                 }
@@ -859,10 +1079,16 @@ impl App {
             Key::Return | Key::Space => {
                 if let Some(path) = gallery.selected_path() {
                     let path = path.to_path_buf();
+                    // Save current session before loading new file
+                    self.save_current_session();
                     if let Err(e) = self.viewer.load(&path) {
                         tracing::error!("Failed to load image: {}", e);
                     } else {
+                        self.recent_files.add(&path);
+                        let _ = self.recent_files.save();
                         self.mode = ViewMode::Image;
+                        // Restore session for the newly loaded file
+                        self.restore_session(&path);
                     }
                 }
                 self.needs_redraw = true;
@@ -995,6 +1221,77 @@ impl App {
 
         child.wait().context("xclip failed")?;
         Ok(())
+    }
+
+    /// Copy current image/page to clipboard as PNG
+    fn copy_image_to_clipboard(&mut self) -> Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // Get PNG data from viewer
+        let png_data = self.viewer.current_page_png()?;
+
+        // Use xclip to copy image data
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn xclip - is it installed?")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&png_data).context("Failed to write PNG to xclip")?;
+        }
+
+        child.wait().context("xclip failed")?;
+        Ok(())
+    }
+
+    /// Open a file dialog using garfield in picker mode
+    fn open_file_dialog(&self) -> Result<Option<PathBuf>> {
+        use std::process::{Command, Stdio};
+
+        // Supported file formats filter (semicolon-separated glob patterns)
+        const FILE_FILTER: &str = "*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.tiff;*.tif;\
+            *.ico;*.avif;*.qoi;*.ppm;*.pgm;*.pbm;*.tga;*.dds;*.exr;*.ff;*.apng;\
+            *.svg;*.svgz;*.pdf";
+
+        // Get parent window ID for proper focus/raise behavior
+        let parent_window = format!("{}", self.window.id());
+
+        // Spawn garfield in picker mode with filters and parent window
+        // Note: clap converts underscores to hyphens in long flags
+        let output = Command::new("garfield")
+            .args([
+                "--picker",
+                "--filter", FILE_FILTER,
+                "--parent-window", &parent_window,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("Failed to spawn garfield --picker")?;
+
+        // Log any stderr for debugging
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!("garfield stderr: {}", stderr);
+        }
+
+        // Exit code 0 = file selected, 1 = cancelled
+        if !output.status.success() {
+            return Ok(None); // User cancelled
+        }
+
+        // Read first line of stdout (the selected file path)
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path_str = path_str.trim();
+
+        if path_str.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(PathBuf::from(path_str)))
     }
 
     /// Handle a link click
@@ -1146,6 +1443,15 @@ impl App {
         // Render go to page dialog if active
         if self.goto_page_active {
             self.render_goto_page_dialog(size.width)?;
+        }
+
+        // Render recent files panel if active
+        if self.recent_panel_active {
+            self.render_recent_panel(size.width, size.height)?;
+        }
+
+        if self.properties_panel_active {
+            self.render_properties_panel(size.width, size.height)?;
         }
 
         // Copy to window
@@ -2059,5 +2365,358 @@ impl App {
 
         ctx.restore()?;
         Ok(())
+    }
+
+    fn render_recent_panel(&mut self, width: u32, height: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        // Panel dimensions - centered, takes up most of the screen
+        let panel_width = 600.0_f64.min(width as f64 - 80.0);
+        let panel_height = 400.0_f64.min(height as f64 - 80.0);
+        let panel_x = (width as f64 - panel_width) / 2.0;
+        let panel_y = (height as f64 - panel_height) / 2.0;
+        let padding = 16.0;
+        let radius = 8.0;
+        let item_height = 28.0;
+        let header_height = 40.0;
+
+        ctx.save()?;
+
+        // Draw semi-transparent overlay
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+        ctx.rectangle(0.0, 0.0, width as f64, height as f64);
+        ctx.fill()?;
+
+        // Draw panel background with rounded corners
+        ctx.new_path();
+        ctx.arc(panel_x + radius, panel_y + radius, radius, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(panel_x + panel_width - radius, panel_y + radius, radius, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        ctx.arc(panel_x + panel_width - radius, panel_y + panel_height - radius, radius, 0.0, 0.5 * std::f64::consts::PI);
+        ctx.arc(panel_x + radius, panel_y + panel_height - radius, radius, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+        ctx.close_path();
+
+        // Fill background
+        ctx.set_source_rgba(0.12, 0.12, 0.14, 0.98);
+        ctx.fill_preserve()?;
+
+        // Draw border
+        ctx.set_source_rgb(0.3, 0.3, 0.35);
+        ctx.set_line_width(1.0);
+        ctx.stroke()?;
+
+        // Draw header
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Bold,
+        );
+        ctx.set_font_size(16.0);
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        ctx.move_to(panel_x + padding, panel_y + padding + 20.0);
+        ctx.show_text("Recent Files")?;
+
+        // Draw hint
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(11.0);
+        ctx.set_source_rgb(0.5, 0.5, 0.5);
+        let hint = "j/k: navigate  Enter: open  d: remove  Esc: close";
+        let hint_extents = ctx.text_extents(hint)?;
+        ctx.move_to(panel_x + panel_width - padding - hint_extents.width(), panel_y + padding + 20.0);
+        ctx.show_text(hint)?;
+
+        // Draw separator
+        ctx.set_source_rgb(0.25, 0.25, 0.28);
+        ctx.set_line_width(1.0);
+        ctx.move_to(panel_x + padding, panel_y + header_height);
+        ctx.line_to(panel_x + panel_width - padding, panel_y + header_height);
+        ctx.stroke()?;
+
+        // Draw file list
+        let list_y = panel_y + header_height + 8.0;
+        let max_visible = ((panel_height - header_height - 16.0) / item_height) as usize;
+        let total_items = self.recent_files.len() + 1; // +1 for "Open File..."
+
+        ctx.set_font_size(13.0);
+
+        // Draw "Open File..." as first item (index 0)
+        {
+            let y = list_y + item_height;
+
+            // Highlight if selected
+            if self.recent_panel_selected == 0 {
+                ctx.set_source_rgba(0.2, 0.4, 0.7, 0.5);
+                ctx.rectangle(
+                    panel_x + padding - 4.0,
+                    y - item_height + 8.0,
+                    panel_width - padding * 2.0 + 8.0,
+                    item_height,
+                );
+                ctx.fill()?;
+            }
+
+            // "Open File..." text with accent color
+            ctx.set_source_rgb(0.5, 0.75, 0.95);
+            ctx.move_to(panel_x + padding, y);
+            ctx.show_text("Open File...")?;
+
+            // Hint text
+            ctx.set_source_rgb(0.45, 0.45, 0.5);
+            ctx.set_font_size(11.0);
+            ctx.move_to(panel_x + padding + 100.0, y);
+            ctx.show_text("Browse with garfield")?;
+            ctx.set_font_size(13.0);
+        }
+
+        // Draw recent files (starting at visual index 1, selection index 1+)
+        if self.recent_files.is_empty() {
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.move_to(panel_x + padding, list_y + 2.0 * item_height);
+            ctx.show_text("No recent files")?;
+        } else {
+            for (i, entry) in self.recent_files.files().iter().take(max_visible.saturating_sub(1)).enumerate() {
+                let visual_index = i + 1; // Offset by 1 for "Open File..."
+                let y = list_y + (visual_index as f64 + 1.0) * item_height;
+
+                // Highlight selected
+                if visual_index == self.recent_panel_selected {
+                    ctx.set_source_rgba(0.2, 0.4, 0.7, 0.5);
+                    ctx.rectangle(
+                        panel_x + padding - 4.0,
+                        y - item_height + 8.0,
+                        panel_width - padding * 2.0 + 8.0,
+                        item_height,
+                    );
+                    ctx.fill()?;
+                }
+
+                // File name
+                ctx.set_source_rgb(0.85, 0.85, 0.85);
+                ctx.move_to(panel_x + padding, y);
+                let filename = entry.filename();
+                // Truncate long filenames
+                let display_name = if filename.len() > 50 {
+                    format!("{}...", &filename[..47])
+                } else {
+                    filename.to_string()
+                };
+                ctx.show_text(&display_name)?;
+
+                // Path (dimmed)
+                ctx.set_source_rgb(0.45, 0.45, 0.5);
+                ctx.set_font_size(11.0);
+                let parent = entry.path.parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                let display_path = if parent.len() > 60 {
+                    format!("...{}", &parent[parent.len()-57..])
+                } else {
+                    parent.to_string()
+                };
+                let name_extents = ctx.text_extents(&display_name)?;
+                ctx.move_to(panel_x + padding + name_extents.width() + 16.0, y);
+                ctx.show_text(&display_path)?;
+
+                // Time ago (right-aligned)
+                let time_str = format_time_ago(entry.last_opened);
+                let time_extents = ctx.text_extents(&time_str)?;
+                ctx.move_to(panel_x + panel_width - padding - time_extents.width(), y);
+                ctx.show_text(&time_str)?;
+
+                ctx.set_font_size(13.0);
+            }
+        }
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_properties_panel(&mut self, width: u32, height: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        // Get file info
+        let file_info = self.viewer.file_info();
+
+        // Panel dimensions - centered, smaller than recent panel
+        let panel_width = 450.0_f64.min(width as f64 - 80.0);
+        let panel_height = 280.0_f64.min(height as f64 - 80.0);
+        let panel_x = (width as f64 - panel_width) / 2.0;
+        let panel_y = (height as f64 - panel_height) / 2.0;
+        let padding = 20.0;
+        let radius = 8.0;
+        let row_height = 32.0;
+        let header_height = 48.0;
+
+        ctx.save()?;
+
+        // Draw semi-transparent overlay
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.5);
+        ctx.rectangle(0.0, 0.0, width as f64, height as f64);
+        ctx.fill()?;
+
+        // Draw panel background with rounded corners
+        ctx.new_path();
+        ctx.arc(panel_x + radius, panel_y + radius, radius, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(panel_x + panel_width - radius, panel_y + radius, radius, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        ctx.arc(panel_x + panel_width - radius, panel_y + panel_height - radius, radius, 0.0, 0.5 * std::f64::consts::PI);
+        ctx.arc(panel_x + radius, panel_y + panel_height - radius, radius, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+        ctx.close_path();
+
+        // Fill background
+        ctx.set_source_rgba(0.12, 0.12, 0.14, 0.98);
+        ctx.fill_preserve()?;
+
+        // Draw border
+        ctx.set_source_rgb(0.3, 0.3, 0.35);
+        ctx.set_line_width(1.0);
+        ctx.stroke()?;
+
+        // Draw header
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Bold,
+        );
+        ctx.set_font_size(16.0);
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        ctx.move_to(panel_x + padding, panel_y + padding + 20.0);
+        ctx.show_text("Properties")?;
+
+        // Draw hint
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(11.0);
+        ctx.set_source_rgb(0.5, 0.5, 0.5);
+        let hint = "Esc/Enter: close";
+        let hint_extents = ctx.text_extents(hint)?;
+        ctx.move_to(panel_x + panel_width - padding - hint_extents.width(), panel_y + padding + 20.0);
+        ctx.show_text(hint)?;
+
+        // Draw separator
+        ctx.set_source_rgb(0.25, 0.25, 0.28);
+        ctx.set_line_width(1.0);
+        ctx.move_to(panel_x + padding, panel_y + header_height);
+        ctx.line_to(panel_x + panel_width - padding, panel_y + header_height);
+        ctx.stroke()?;
+
+        // Draw properties
+        let content_y = panel_y + header_height + padding;
+        let label_x = panel_x + padding;
+        let value_x = panel_x + padding + 100.0;
+
+        ctx.set_font_size(13.0);
+
+        let properties: Vec<(&str, String)> = if let Some(info) = file_info {
+            let mut props = vec![
+                ("Name:", info.filename.clone()),
+                ("Dimensions:", format!("{} x {}", info.width, info.height)),
+                ("File size:", info.format_size()),
+                ("Format:", info.format.clone()),
+            ];
+
+            // Add page count for multi-page documents
+            let page_count = self.viewer.page_count();
+            if page_count > 1 {
+                props.push(("Pages:", format!("{}", page_count)));
+            }
+
+            // Add path
+            if let Some(path) = self.viewer.current_path() {
+                props.push(("Path:", path.display().to_string()));
+            }
+
+            props
+        } else {
+            vec![("No file loaded", String::new())]
+        };
+
+        for (i, (label, value)) in properties.iter().enumerate() {
+            let y = content_y + (i as f64 + 1.0) * row_height;
+
+            // Label
+            ctx.set_source_rgb(0.6, 0.6, 0.65);
+            ctx.move_to(label_x, y);
+            ctx.show_text(label)?;
+
+            // Value
+            ctx.set_source_rgb(0.85, 0.85, 0.85);
+
+            // Truncate long values (especially paths)
+            let max_value_width = panel_width - 100.0 - padding * 2.0 - 20.0;
+            let value_extents = ctx.text_extents(value)?;
+            let display_value = if value_extents.width() > max_value_width {
+                // Truncate from the beginning for paths
+                let chars: Vec<char> = value.chars().collect();
+                let mut truncated = String::from("...");
+                for c in chars.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                    truncated.push(*c);
+                }
+                truncated
+            } else {
+                value.clone()
+            };
+
+            ctx.move_to(value_x, y);
+            ctx.show_text(&display_value)?;
+        }
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    /// Save current session state (zoom, scroll, page) for the current file
+    fn save_current_session(&mut self) {
+        if let Some(path) = self.viewer.current_path() {
+            let page = self.viewer.current_page();
+            let zoom = self.viewer.zoom.level * 100.0; // Convert to percentage
+            let scroll = (self.viewer.scroll.offset_x, self.viewer.scroll.offset_y);
+            self.recent_files.update_session(&path, page, zoom, scroll);
+            let _ = self.recent_files.save();
+        }
+    }
+
+    /// Restore session state for a file if available
+    fn restore_session(&mut self, path: &Path) {
+        if let Some((page, zoom, scroll)) = self.recent_files.get_session(path) {
+            // Restore page
+            if page < self.viewer.page_count() {
+                self.viewer.goto_page(page);
+            }
+            // Restore zoom (convert from percentage)
+            self.viewer.zoom.mode = ZoomMode::Custom(zoom / 100.0);
+            self.viewer.zoom.level = zoom / 100.0;
+            // Restore scroll position
+            self.viewer.scroll.offset_x = scroll.0;
+            self.viewer.scroll.offset_y = scroll.1;
+        }
+    }
+}
+
+/// Format a SystemTime as a human-readable "time ago" string
+fn format_time_ago(time: SystemTime) -> String {
+    let now = SystemTime::now();
+    let duration = now.duration_since(time).unwrap_or_default();
+    let secs = duration.as_secs();
+
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        format!("{}m ago", mins)
+    } else if secs < 86400 {
+        let hours = secs / 3600;
+        format!("{}h ago", hours)
+    } else if secs < 604800 {
+        let days = secs / 86400;
+        format!("{}d ago", days)
+    } else {
+        let weeks = secs / 604800;
+        format!("{}w ago", weeks)
     }
 }
