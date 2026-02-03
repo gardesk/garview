@@ -58,6 +58,10 @@ pub struct App {
     search_input: String,
     /// Text selection in progress
     selecting_text: bool,
+    /// Go to page dialog active
+    goto_page_active: bool,
+    /// Go to page input
+    goto_page_input: String,
 }
 
 impl App {
@@ -148,6 +152,8 @@ impl App {
             search_active: false,
             search_input: String::new(),
             selecting_text: false,
+            goto_page_active: false,
+            goto_page_input: String::new(),
         })
     }
 
@@ -278,6 +284,44 @@ impl App {
                     return Ok(true);
                 }
 
+                // Go to page dialog input
+                if self.goto_page_active {
+                    match key_event.key {
+                        Key::Escape => {
+                            self.goto_page_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Return => {
+                            // Go to the entered page
+                            if let Ok(page_num) = self.goto_page_input.parse::<usize>() {
+                                // Convert 1-based user input to 0-based index
+                                if page_num > 0 && page_num <= self.viewer.page_count() {
+                                    self.viewer.goto_page(page_num - 1);
+                                    // Update sidebar if visible
+                                    if self.sidebar.visible {
+                                        self.sidebar.selected_page = Some(page_num - 1);
+                                        let size = self.renderer.size();
+                                        let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                                        self.sidebar.scroll_to_page(page_num - 1, viewport_height);
+                                    }
+                                }
+                            }
+                            self.goto_page_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Backspace => {
+                            self.goto_page_input.pop();
+                            self.needs_redraw = true;
+                        }
+                        Key::Char(c) if c.is_ascii_digit() => {
+                            self.goto_page_input.push(c);
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
                 // Global keys
                 match key_event.key {
                     Key::Escape => {
@@ -324,13 +368,21 @@ impl App {
                             self.sidebar.scroll_to_page(current_page, viewport_height);
                             // Generate thumbnails for visible pages
                             self.generate_sidebar_thumbnails();
+                            // Populate table of contents if available
+                            if self.viewer.has_toc() {
+                                let toc_entries = self.viewer.get_toc();
+                                let toc: Vec<crate::ui::TocEntry> = toc_entries
+                                    .into_iter()
+                                    .map(|(title, page, level)| crate::ui::TocEntry {
+                                        title,
+                                        page,
+                                        level,
+                                    })
+                                    .collect();
+                                self.sidebar.set_toc(toc);
+                            }
                         }
                         self.needs_redraw = true;
-                        return Ok(true);
-                    }
-                    Key::Tab | Key::Char('g') => {
-                        // Toggle between image and gallery mode
-                        self.toggle_view_mode();
                         return Ok(true);
                     }
                     // Search shortcuts
@@ -340,6 +392,20 @@ impl App {
                             self.search_input.clear();
                             self.needs_redraw = true;
                         }
+                        return Ok(true);
+                    }
+                    // Go to page (Ctrl+G)
+                    Key::Char('g') if key_event.modifiers.ctrl => {
+                        if self.viewer.is_multipage() {
+                            self.goto_page_active = true;
+                            self.goto_page_input.clear();
+                            self.needs_redraw = true;
+                        }
+                        return Ok(true);
+                    }
+                    Key::Tab | Key::Char('g') => {
+                        // Toggle between image and gallery mode
+                        self.toggle_view_mode();
                         return Ok(true);
                     }
                     Key::F3 | Key::Char('n') if !self.viewer.search.results.is_empty() => {
@@ -1063,6 +1129,11 @@ impl App {
             self.render_search_status(size.width)?;
         }
 
+        // Render go to page dialog if active
+        if self.goto_page_active {
+            self.render_goto_page_dialog(size.width)?;
+        }
+
         // Copy to window
         self.renderer.flush();
         copy_surface_to_window(self.renderer.surface_mut(), &self.window, self.gc, 0, 0)?;
@@ -1740,6 +1811,78 @@ impl App {
             );
             ctx.show_text(text)?;
         }
+        Ok(())
+    }
+
+    fn render_goto_page_dialog(&mut self, width: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        // Dialog dimensions
+        let dialog_width = 250.0_f64.min(width as f64 - 40.0);
+        let dialog_height = 32.0;
+        let dialog_x = (width as f64 - dialog_width) / 2.0;
+        let dialog_y = 10.0;
+        let padding = 8.0;
+        let radius = 4.0;
+
+        ctx.save()?;
+
+        // Draw background with rounded corners
+        ctx.new_path();
+        ctx.arc(dialog_x + radius, dialog_y + radius, radius, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(dialog_x + dialog_width - radius, dialog_y + radius, radius, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        ctx.arc(dialog_x + dialog_width - radius, dialog_y + dialog_height - radius, radius, 0.0, 0.5 * std::f64::consts::PI);
+        ctx.arc(dialog_x + radius, dialog_y + dialog_height - radius, radius, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+        ctx.close_path();
+
+        // Fill background
+        ctx.set_source_rgba(0.15, 0.15, 0.15, 0.95);
+        ctx.fill_preserve()?;
+
+        // Draw border
+        ctx.set_source_rgb(0.4, 0.4, 0.4);
+        ctx.set_line_width(1.0);
+        ctx.stroke()?;
+
+        // Draw label
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(14.0);
+
+        let label = format!("Go to page (1-{}):", self.viewer.page_count());
+        let text_y = dialog_y + dialog_height / 2.0 + 5.0;
+
+        ctx.set_source_rgb(0.7, 0.7, 0.7);
+        ctx.move_to(dialog_x + padding, text_y);
+        ctx.show_text(&label)?;
+
+        // Get label width for positioning input
+        let label_extents = ctx.text_extents(&label)?;
+        let input_x = dialog_x + padding + label_extents.width() + 8.0;
+
+        // Draw input text
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        if self.goto_page_input.is_empty() {
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.move_to(input_x, text_y);
+            ctx.show_text("#")?;
+        } else {
+            ctx.move_to(input_x, text_y);
+            ctx.show_text(&self.goto_page_input)?;
+        }
+
+        // Draw cursor
+        let input_extents = ctx.text_extents(&self.goto_page_input)?;
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        ctx.set_line_width(1.0);
+        ctx.move_to(input_x + input_extents.width() + 2.0, dialog_y + 8.0);
+        ctx.line_to(input_x + input_extents.width() + 2.0, dialog_y + dialog_height - 8.0);
+        ctx.stroke()?;
+
+        ctx.restore()?;
         Ok(())
     }
 }
