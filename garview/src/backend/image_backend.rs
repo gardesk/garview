@@ -188,8 +188,9 @@ impl Backend for ImageBackend {
             let new_width = (orig_width as f64 * scale).round() as u32;
             let new_height = (orig_height as f64 * scale).round() as u32;
 
+            // Use fast bilinear filter for snappy rendering
             let resized =
-                img.resize_exact(new_width, new_height, image::imageops::FilterType::Lanczos3);
+                img.resize_exact(new_width, new_height, image::imageops::FilterType::Triangle);
 
             let rgba = resized.to_rgba8();
             Ok(RenderedPage {

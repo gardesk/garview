@@ -101,6 +101,11 @@ impl App {
                 }
                 event_loop.redraw_done();
                 self.needs_redraw = false;
+
+                // If showing preview, schedule upgrade to final quality
+                if self.viewer.needs_quality_upgrade() {
+                    event_loop.request_redraw();
+                }
             }
 
             Ok(should_continue)
@@ -273,8 +278,12 @@ impl App {
             let offset_x = self.viewer.scroll.offset_x;
             let offset_y = self.viewer.scroll.offset_y;
 
-            // Render the image
+            // Render the image (may be preview or final quality)
+            let current_scale = self.viewer.current_scale();
             if let Ok(image_surface) = self.viewer.render(zoom) {
+                // Calculate scale factor to upscale preview to target size
+                let upscale = zoom / current_scale;
+
                 // Calculate position (centered if smaller than viewport)
                 let x = if scaled_w < size.width as f64 {
                     (size.width as f64 - scaled_w) / 2.0
@@ -310,6 +319,11 @@ impl App {
                 }
 
                 ctx.translate(-scaled_w / 2.0, -scaled_h / 2.0);
+
+                // Scale up if showing preview (smooth bilinear filtering)
+                if upscale > 1.001 {
+                    ctx.scale(upscale, upscale);
+                }
 
                 // Paint the image surface
                 ctx.set_source_surface(image_surface.cairo_surface(), 0.0, 0.0)?;

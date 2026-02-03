@@ -57,7 +57,9 @@ impl StatusBar {
             .color(self.theme.foreground);
 
         let padding = 8.0;
-        let text_y = y as f64 + (self.height as f64 - 12.0) / 2.0 + 10.0;
+        // Center text vertically: top-left at y + (height - text_height) / 2
+        // Approximate text height ~14px for 12pt font
+        let text_y = y as f64 + (self.height as f64 - 14.0) / 2.0;
 
         // Left side: file info
         if let Some(info) = file_info {
