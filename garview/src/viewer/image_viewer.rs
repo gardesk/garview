@@ -1159,6 +1159,21 @@ impl ImageViewer {
             .map(|(rect, _)| rect)
             .collect()
     }
+
+    // Table of contents methods
+
+    /// Check if the current document has a table of contents
+    pub fn has_toc(&self) -> bool {
+        self.backend.as_ref().map(|b| b.has_toc()).unwrap_or(false)
+    }
+
+    /// Get table of contents entries (title, page, level)
+    pub fn get_toc(&self) -> Vec<(String, usize, usize)> {
+        self.backend
+            .as_ref()
+            .map(|b| b.get_toc())
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for ImageViewer {
