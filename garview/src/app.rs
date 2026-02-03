@@ -3,11 +3,38 @@ use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
 use crate::config::Config;
 use crate::ui::{StatusBar, STATUS_BAR_HEIGHT};
-use crate::viewer::{ImageViewer, LoadState};
+use crate::viewer::{GalleryView, ImageViewer, LoadState, SortOrder};
+
+/// Current view mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ViewMode {
+    /// Single image viewer
+    Image,
+    /// Gallery/thumbnail grid
+    Gallery,
+}
+
+/// Slideshow state
+struct SlideshowState {
+    active: bool,
+    interval: Duration,
+    last_advance: Instant,
+}
+
+impl Default for SlideshowState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            interval: Duration::from_secs(3),
+            last_advance: Instant::now(),
+        }
+    }
+}
 
 /// Main application state
 pub struct App {
@@ -15,6 +42,9 @@ pub struct App {
     renderer: Renderer,
     gc: u32,
     viewer: ImageViewer,
+    gallery: Option<GalleryView>,
+    mode: ViewMode,
+    slideshow: SlideshowState,
     statusbar: StatusBar,
     #[allow(dead_code)]
     config: Config,
@@ -23,7 +53,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(path: Option<String>, fullscreen: bool) -> Result<Self> {
+    pub fn new(path: Option<String>, fullscreen: bool, slideshow: bool) -> Result<Self> {
         // Load configuration
         let config = Config::load().unwrap_or_else(|e| {
             tracing::warn!("Failed to load config: {}, using defaults", e);
@@ -52,6 +82,8 @@ impl App {
 
         let statusbar = StatusBar::new(theme);
         let mut viewer = ImageViewer::new();
+        let mut gallery: Option<GalleryView> = None;
+        let mut mode = ViewMode::Image;
 
         // Apply default zoom from config
         match config.general.default_zoom.as_str() {
@@ -61,7 +93,7 @@ impl App {
             _ => viewer.zoom.zoom_fit(),
         }
 
-        // Load initial file if provided
+        // Load initial file or directory if provided
         if let Some(ref path_str) = path {
             let path = Path::new(path_str);
             if path.is_file() {
@@ -69,9 +101,26 @@ impl App {
                     tracing::error!("Failed to load {}: {}", path.display(), e);
                 }
             } else if path.is_dir() {
-                // TODO: Gallery mode - load first image in directory
-                tracing::info!("Directory mode not yet implemented");
+                // Gallery mode
+                match GalleryView::new() {
+                    Ok(mut gal) => {
+                        if let Err(e) = gal.open(path) {
+                            tracing::error!("Failed to open directory: {}", e);
+                        } else {
+                            mode = ViewMode::Gallery;
+                            gallery = Some(gal);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create gallery: {}", e);
+                    }
+                }
             }
+        }
+
+        let mut slideshow_state = SlideshowState::default();
+        if slideshow {
+            slideshow_state.active = true;
         }
 
         Ok(Self {
@@ -79,6 +128,9 @@ impl App {
             renderer,
             gc,
             viewer,
+            gallery,
+            mode,
+            slideshow: slideshow_state,
             statusbar,
             config,
             fullscreen,
@@ -106,19 +158,53 @@ impl App {
                 }
             };
 
-            // Poll async image loading
-            if self.viewer.poll_load() {
-                self.needs_redraw = true;
-            }
+            // Poll based on current mode
+            match self.mode {
+                ViewMode::Image => {
+                    // Poll async image loading
+                    if self.viewer.poll_load() {
+                        self.needs_redraw = true;
+                        // Reset slideshow timer on new image
+                        if self.slideshow.active {
+                            self.slideshow.last_advance = Instant::now();
+                        }
+                    }
 
-            // Request continuous redraw while loading (for spinner animation)
-            if self.viewer.load_state() == LoadState::Loading {
-                event_loop.request_redraw();
-            }
+                    // Request continuous redraw while loading (for spinner animation)
+                    if self.viewer.load_state() == LoadState::Loading {
+                        event_loop.request_redraw();
+                    }
 
-            // Tick animation
-            if self.viewer.is_animated() && self.viewer.tick_animation() {
-                event_loop.request_redraw();
+                    // Tick animation
+                    if self.viewer.is_animated() && self.viewer.tick_animation() {
+                        event_loop.request_redraw();
+                    }
+
+                    // Slideshow auto-advance
+                    if self.slideshow.active
+                        && self.viewer.load_state() == LoadState::Ready
+                        && self.slideshow.last_advance.elapsed() >= self.slideshow.interval
+                    {
+                        if let Err(e) = self.viewer.next_image() {
+                            tracing::debug!("Slideshow advance: {}", e);
+                        }
+                        self.slideshow.last_advance = Instant::now();
+                        self.needs_redraw = true;
+                    }
+
+                    // Request redraw for slideshow timing
+                    if self.slideshow.active {
+                        event_loop.request_redraw();
+                    }
+                }
+                ViewMode::Gallery => {
+                    // Poll thumbnail generation
+                    if let Some(ref mut gallery) = self.gallery {
+                        if gallery.poll_thumbnails() {
+                            self.needs_redraw = true;
+                        }
+                    }
+                }
             }
 
             // Render if needed
@@ -151,136 +237,281 @@ impl App {
             }
 
             InputEvent::Key(key_event) if key_event.pressed => {
+                // Global keys
                 match key_event.key {
                     Key::Escape | Key::Char('q') => return Ok(false),
-
-                    // Zoom
-                    Key::Char('+') | Key::Char('=') => {
-                        self.viewer.zoom.zoom_in();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('-') => {
-                        self.viewer.zoom.zoom_out();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('0') => {
-                        self.viewer.zoom.zoom_one_to_one();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('f') => {
-                        self.viewer.zoom.zoom_fit();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('F') => {
-                        self.viewer.zoom.zoom_fill();
-                        self.needs_redraw = true;
-                    }
-
-                    // Fullscreen
                     Key::F11 => {
                         if let Err(e) = self.toggle_fullscreen() {
                             tracing::error!("Failed to toggle fullscreen: {}", e);
                         }
+                        return Ok(true);
                     }
-
-                    // Navigation
-                    Key::Right | Key::Char('n') | Key::Space => {
-                        if let Err(e) = self.viewer.next_image() {
-                            tracing::error!("Failed to load next image: {}", e);
-                        }
-                        self.needs_redraw = true;
+                    Key::Tab | Key::Char('g') => {
+                        // Toggle between image and gallery mode
+                        self.toggle_view_mode();
+                        return Ok(true);
                     }
-                    Key::Left | Key::Char('p') => {
-                        if let Err(e) = self.viewer.prev_image() {
-                            tracing::error!("Failed to load previous image: {}", e);
-                        }
-                        self.needs_redraw = true;
-                    }
-
-                    // Rotation
-                    Key::Char('r') => {
-                        self.viewer.rotate_cw();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('R') => {
-                        self.viewer.rotate_ccw();
-                        self.needs_redraw = true;
-                    }
-
-                    // Flip
-                    Key::Char('h') => {
-                        self.viewer.flip_horizontal();
-                        self.needs_redraw = true;
-                    }
-                    Key::Char('v') => {
-                        self.viewer.flip_vertical();
-                        self.needs_redraw = true;
-                    }
-
-                    // Pan with arrow keys when zoomed
-                    Key::Up if key_event.modifiers.is_empty() => {
-                        self.viewer.scroll.pan(0.0, -50.0);
-                        self.needs_redraw = true;
-                    }
-                    Key::Down if key_event.modifiers.is_empty() => {
-                        self.viewer.scroll.pan(0.0, 50.0);
-                        self.needs_redraw = true;
-                    }
-
                     _ => {}
+                }
+
+                // Mode-specific keys
+                match self.mode {
+                    ViewMode::Image => self.handle_image_key(key_event.key, &key_event.modifiers),
+                    ViewMode::Gallery => self.handle_gallery_key(key_event.key),
                 }
             }
 
             InputEvent::MousePress(mouse_event) => {
-                if mouse_event.button == Some(MouseButton::Left) {
+                if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     self.viewer.scroll.start_drag(mouse_event.position);
                 }
             }
 
             InputEvent::MouseRelease(mouse_event) => {
-                if mouse_event.button == Some(MouseButton::Left) {
+                if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     self.viewer.scroll.end_drag();
                 }
             }
 
             InputEvent::MouseMove(mouse_event) => {
-                if self.viewer.scroll.is_dragging() {
+                if self.mode == ViewMode::Image && self.viewer.scroll.is_dragging() {
                     self.viewer.scroll.update_drag(mouse_event.position);
                     self.needs_redraw = true;
                 }
             }
 
             InputEvent::Scroll(scroll_event) => {
-                // Zoom with scroll wheel
-                if scroll_event.modifiers.ctrl {
-                    let factor = if scroll_event.delta_y < 0 { 1.1 } else { 0.9 };
-                    let size = self.renderer.size();
-                    let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
-                    self.viewer.zoom_at_point(
-                        factor,
-                        scroll_event.position.x as f64,
-                        scroll_event.position.y as f64,
-                        size.width as f64,
-                        viewport_height as f64,
-                    );
-                } else {
-                    // Pan
-                    self.viewer.scroll.pan(
-                        scroll_event.delta_x as f64 * 30.0,
-                        scroll_event.delta_y as f64 * 30.0,
-                    );
+                match self.mode {
+                    ViewMode::Image => {
+                        if scroll_event.modifiers.ctrl {
+                            let factor = if scroll_event.delta_y < 0 { 1.1 } else { 0.9 };
+                            let size = self.renderer.size();
+                            let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                            self.viewer.zoom_at_point(
+                                factor,
+                                scroll_event.position.x as f64,
+                                scroll_event.position.y as f64,
+                                size.width as f64,
+                                viewport_height as f64,
+                            );
+                        } else {
+                            self.viewer.scroll.pan(
+                                scroll_event.delta_x as f64 * 30.0,
+                                scroll_event.delta_y as f64 * 30.0,
+                            );
+                        }
+                    }
+                    ViewMode::Gallery => {
+                        if let Some(ref mut gallery) = self.gallery {
+                            let size = self.renderer.size();
+                            let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+                            gallery.scroll(scroll_event.delta_y as f64 * 30.0, viewport_height);
+                        }
+                    }
                 }
                 self.needs_redraw = true;
             }
 
-            InputEvent::Idle => {
-                // Animation tick happens in run()
-            }
+            InputEvent::Idle => {}
 
             _ => {}
         }
 
         Ok(true)
+    }
+
+    fn handle_image_key(&mut self, key: Key, modifiers: &gartk_core::Modifiers) {
+        match key {
+            // Zoom
+            Key::Char('+') | Key::Char('=') => {
+                self.viewer.zoom.zoom_in();
+                self.needs_redraw = true;
+            }
+            Key::Char('-') => {
+                self.viewer.zoom.zoom_out();
+                self.needs_redraw = true;
+            }
+            Key::Char('0') => {
+                self.viewer.zoom.zoom_one_to_one();
+                self.needs_redraw = true;
+            }
+            Key::Char('f') => {
+                self.viewer.zoom.zoom_fit();
+                self.needs_redraw = true;
+            }
+            Key::Char('F') => {
+                self.viewer.zoom.zoom_fill();
+                self.needs_redraw = true;
+            }
+
+            // Navigation
+            Key::Right | Key::Char('n') | Key::Space => {
+                if let Err(e) = self.viewer.next_image() {
+                    tracing::error!("Failed to load next image: {}", e);
+                }
+                self.needs_redraw = true;
+            }
+            Key::Left | Key::Char('p') => {
+                if let Err(e) = self.viewer.prev_image() {
+                    tracing::error!("Failed to load previous image: {}", e);
+                }
+                self.needs_redraw = true;
+            }
+
+            // Rotation
+            Key::Char('r') => {
+                self.viewer.rotate_cw();
+                self.needs_redraw = true;
+            }
+            Key::Char('R') => {
+                self.viewer.rotate_ccw();
+                self.needs_redraw = true;
+            }
+
+            // Flip
+            Key::Char('h') => {
+                self.viewer.flip_horizontal();
+                self.needs_redraw = true;
+            }
+            Key::Char('v') => {
+                self.viewer.flip_vertical();
+                self.needs_redraw = true;
+            }
+
+            // Pan with arrow keys when zoomed
+            Key::Up if modifiers.is_empty() => {
+                self.viewer.scroll.pan(0.0, -50.0);
+                self.needs_redraw = true;
+            }
+            Key::Down if modifiers.is_empty() => {
+                self.viewer.scroll.pan(0.0, 50.0);
+                self.needs_redraw = true;
+            }
+
+            // Slideshow controls
+            Key::Char('s') => {
+                self.slideshow.active = !self.slideshow.active;
+                if self.slideshow.active {
+                    self.slideshow.last_advance = Instant::now();
+                    tracing::info!("Slideshow started ({:.1}s interval)", self.slideshow.interval.as_secs_f64());
+                } else {
+                    tracing::info!("Slideshow stopped");
+                }
+                self.needs_redraw = true;
+            }
+            Key::Char('[') => {
+                // Decrease slideshow interval (min 1s)
+                let new_interval = self.slideshow.interval.as_secs_f64() - 0.5;
+                self.slideshow.interval = Duration::from_secs_f64(new_interval.max(1.0));
+                self.needs_redraw = true;
+            }
+            Key::Char(']') => {
+                // Increase slideshow interval (max 30s)
+                let new_interval = self.slideshow.interval.as_secs_f64() + 0.5;
+                self.slideshow.interval = Duration::from_secs_f64(new_interval.min(30.0));
+                self.needs_redraw = true;
+            }
+
+            _ => {}
+        }
+    }
+
+    fn handle_gallery_key(&mut self, key: Key) {
+        let Some(ref mut gallery) = self.gallery else {
+            return;
+        };
+
+        match key {
+            // Navigation
+            Key::Right | Key::Char('l') => {
+                gallery.select_next();
+                self.needs_redraw = true;
+            }
+            Key::Left | Key::Char('h') => {
+                gallery.select_prev();
+                self.needs_redraw = true;
+            }
+            Key::Down | Key::Char('j') => {
+                gallery.select_down();
+                self.needs_redraw = true;
+            }
+            Key::Up | Key::Char('k') => {
+                gallery.select_up();
+                self.needs_redraw = true;
+            }
+
+            // Open selected image
+            Key::Return | Key::Space => {
+                if let Some(path) = gallery.selected_path() {
+                    let path = path.to_path_buf();
+                    if let Err(e) = self.viewer.load(&path) {
+                        tracing::error!("Failed to load image: {}", e);
+                    } else {
+                        self.mode = ViewMode::Image;
+                    }
+                }
+                self.needs_redraw = true;
+            }
+
+            // Sorting (s + modifier for sort type)
+            Key::Char('s') => {
+                // Cycle through sort modes: Name -> Date -> Size -> Name...
+                let new_order = match gallery.sort_order() {
+                    SortOrder::Name | SortOrder::NameDesc => SortOrder::Date,
+                    SortOrder::Date | SortOrder::DateDesc => SortOrder::Size,
+                    SortOrder::Size | SortOrder::SizeDesc => SortOrder::Name,
+                };
+                gallery.set_sort(new_order);
+                self.needs_redraw = true;
+            }
+            Key::Char('S') => {
+                // Reverse current sort
+                let new_order = match gallery.sort_order() {
+                    SortOrder::Name => SortOrder::NameDesc,
+                    SortOrder::NameDesc => SortOrder::Name,
+                    SortOrder::Date => SortOrder::DateDesc,
+                    SortOrder::DateDesc => SortOrder::Date,
+                    SortOrder::Size => SortOrder::SizeDesc,
+                    SortOrder::SizeDesc => SortOrder::Size,
+                };
+                gallery.set_sort(new_order);
+                self.needs_redraw = true;
+            }
+
+            _ => {}
+        }
+    }
+
+    fn toggle_view_mode(&mut self) {
+        match self.mode {
+            ViewMode::Image => {
+                // Switch to gallery - need to ensure gallery exists
+                if self.gallery.is_none() {
+                    // Try to create gallery from current image's directory
+                    if let Some(path) = self.viewer.current_path() {
+                        if let Some(parent) = path.parent() {
+                            match GalleryView::new() {
+                                Ok(mut gal) => {
+                                    if gal.open(parent).is_ok() {
+                                        self.gallery = Some(gal);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to create gallery: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.gallery.is_some() {
+                    self.mode = ViewMode::Gallery;
+                }
+            }
+            ViewMode::Gallery => {
+                self.mode = ViewMode::Image;
+            }
+        }
+        self.needs_redraw = true;
     }
 
     /// Toggle fullscreen mode via EWMH _NET_WM_STATE
@@ -321,7 +552,45 @@ impl App {
         // Clear background
         self.renderer.clear()?;
 
-        // Calculate zoom level based on image and viewport size
+        match self.mode {
+            ViewMode::Gallery => self.render_gallery(viewport_height)?,
+            ViewMode::Image => self.render_image(viewport_height)?,
+        }
+
+        // Render status bar
+        let (file_info, zoom_level, zoom_mode, position) = match self.mode {
+            ViewMode::Image => (
+                self.viewer.file_info(),
+                self.viewer.zoom.level,
+                self.viewer.zoom.mode,
+                self.viewer.directory_position(),
+            ),
+            ViewMode::Gallery => {
+                let pos = self.gallery.as_ref().map(|g| (g.selection_index() + 1, g.file_count()));
+                (None, 1.0, crate::viewer::ZoomMode::Fit, pos)
+            }
+        };
+
+        self.statusbar.render(
+            &self.renderer,
+            size.width,
+            viewport_height,
+            file_info.as_ref(),
+            zoom_level,
+            zoom_mode,
+            position,
+        )?;
+
+        // Copy to window
+        self.renderer.flush();
+        copy_surface_to_window(self.renderer.surface_mut(), &self.window, self.gc, 0, 0)?;
+
+        Ok(())
+    }
+
+    fn render_image(&mut self, viewport_height: u32) -> Result<()> {
+        let size = self.renderer.size();
+
         if let Some((img_w, img_h)) = self.viewer.effective_size() {
             self.viewer
                 .zoom
@@ -465,21 +734,31 @@ impl App {
             }
         }
 
-        // Render status bar
-        self.statusbar.render(
-            &self.renderer,
-            size.width,
-            viewport_height,
-            self.viewer.file_info().as_ref(),
-            self.viewer.zoom.level,
-            self.viewer.zoom.mode,
-            self.viewer.directory_position(),
-        )?;
+        Ok(())
+    }
 
-        // Copy to window
-        self.renderer.flush();
-        copy_surface_to_window(self.renderer.surface_mut(), &self.window, self.gc, 0, 0)?;
-
+    fn render_gallery(&mut self, viewport_height: u32) -> Result<()> {
+        if let Some(ref mut gallery) = self.gallery {
+            gallery.render(&self.renderer, viewport_height)?;
+        } else {
+            // No gallery - show message
+            let ctx = self.renderer.context()?;
+            let size = self.renderer.size();
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.select_font_face(
+                "sans-serif",
+                gartk_render::cairo::FontSlant::Normal,
+                gartk_render::cairo::FontWeight::Normal,
+            );
+            ctx.set_font_size(20.0);
+            let text = "No directory loaded. Press 'g' to open gallery.";
+            let extents = ctx.text_extents(text)?;
+            ctx.move_to(
+                (size.width as f64 - extents.width()) / 2.0,
+                (viewport_height as f64 + extents.height()) / 2.0,
+            );
+            ctx.show_text(text)?;
+        }
         Ok(())
     }
 }

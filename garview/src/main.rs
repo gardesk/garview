@@ -3,6 +3,7 @@ use clap::Parser;
 
 mod app;
 mod backend;
+mod cache;
 mod config;
 mod ui;
 mod viewer;
@@ -34,6 +35,6 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let mut app = App::new(args.path, args.fullscreen)?;
+    let mut app = App::new(args.path, args.fullscreen, args.slideshow)?;
     app.run()
 }
