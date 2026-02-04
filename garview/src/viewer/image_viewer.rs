@@ -1175,6 +1175,12 @@ impl ImageViewer {
             .unwrap_or_default()
     }
 
+    /// Get the current page as rendered RGBA data (for annotation mode)
+    pub fn current_rendered_page(&mut self) -> Option<crate::backend::RenderedPage> {
+        let backend = self.backend.as_mut()?;
+        backend.render_page(self.current_frame, 1.0).ok()
+    }
+
     /// Get the current page as PNG bytes for clipboard
     pub fn current_page_png(&mut self) -> Result<Vec<u8>> {
         let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;

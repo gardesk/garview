@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
+use crate::annotate::{AnnotationManager, ToolType};
 use crate::config::Config;
 use crate::recent::RecentFiles;
 use crate::ui::{Sidebar, StatusBar, ThumbnailData, STATUS_BAR_HEIGHT, SIDEBAR_WIDTH};
@@ -71,6 +72,10 @@ pub struct App {
     recent_panel_selected: usize,
     /// Properties panel active
     properties_panel_active: bool,
+    /// Annotation manager (when in annotation mode)
+    annotation: Option<AnnotationManager>,
+    /// Annotation mode active
+    annotation_mode: bool,
 }
 
 impl App {
@@ -191,6 +196,8 @@ impl App {
             recent_panel_active: path.is_none(), // Auto-show when no file argument
             recent_panel_selected: 0,
             properties_panel_active: false,
+            annotation: None,
+            annotation_mode: false,
         })
     }
 
@@ -345,6 +352,69 @@ impl App {
             }
 
             InputEvent::Key(key_event) if key_event.pressed => {
+                // Handle annotation mode input first
+                if self.annotation_mode {
+                    if let Some(ref mut ann) = self.annotation {
+                        match key_event.key {
+                            Key::Escape => {
+                                // Exit annotation mode (discard changes)
+                                self.annotation_mode = false;
+                                self.annotation = None;
+                                self.needs_redraw = true;
+                            }
+                            // Tool selection shortcuts
+                            Key::Char('b') => ann.select_tool(ToolType::Brush),
+                            Key::Char('l') => ann.select_tool(ToolType::Line),
+                            Key::Char('a') => ann.select_tool(ToolType::Arrow),
+                            Key::Char('r') => ann.select_tool(ToolType::Rectangle),
+                            Key::Char('e') => ann.select_tool(ToolType::Ellipse),
+                            Key::Char('t') => ann.select_tool(ToolType::Text),
+                            Key::Char('x') => ann.select_tool(ToolType::Blur),
+                            Key::Char('h') => ann.select_tool(ToolType::Highlight),
+                            // Color presets (1-9)
+                            Key::Char(c @ '1'..='9') => {
+                                let idx = (c as u8 - b'1') as usize;
+                                ann.state.set_color_preset(idx);
+                            }
+                            // Line width adjustments
+                            Key::Char('+') | Key::Char('=') => {
+                                ann.state.properties.increase_line_width();
+                            }
+                            Key::Char('-') => {
+                                ann.state.properties.decrease_line_width();
+                            }
+                            // Toggle fill mode
+                            Key::Char('f') => {
+                                ann.state.toggle_fill();
+                            }
+                            // Undo/Redo
+                            Key::Char('z') if key_event.modifiers.ctrl => {
+                                if key_event.modifiers.shift {
+                                    let _ = ann.redo();
+                                } else {
+                                    let _ = ann.undo();
+                                }
+                            }
+                            Key::Char('y') if key_event.modifiers.ctrl => {
+                                let _ = ann.redo();
+                            }
+                            // Save annotated image (Ctrl+S)
+                            Key::Char('s') if key_event.modifiers.ctrl => {
+                                if let Err(e) = self.save_annotated_image() {
+                                    tracing::error!("Failed to save annotated image: {}", e);
+                                }
+                            }
+                            // Clear all annotations
+                            Key::Delete | Key::Char('c') if key_event.modifiers.ctrl && key_event.modifiers.shift => {
+                                let _ = ann.clear_all();
+                            }
+                            _ => {}
+                        }
+                        self.needs_redraw = true;
+                    }
+                    return Ok(true);
+                }
+
                 // Handle search input mode first
                 if self.search_active {
                     match key_event.key {
@@ -621,6 +691,11 @@ impl App {
                         self.needs_redraw = true;
                         return Ok(true);
                     }
+                    // Toggle annotation mode (Ctrl+A)
+                    Key::Char('a') if key_event.modifiers.ctrl => {
+                        self.toggle_annotation_mode()?;
+                        return Ok(true);
+                    }
                     Key::Tab | Key::Char('g') => {
                         // Toggle between image and gallery mode
                         self.toggle_view_mode();
@@ -651,6 +726,18 @@ impl App {
             }
 
             InputEvent::MousePress(mouse_event) => {
+                // Annotation mode mouse handling
+                if self.annotation_mode {
+                    if let Some(ref mut ann) = self.annotation {
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MousePress(mouse_event.clone())) {
+                            if redraw {
+                                self.needs_redraw = true;
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     // Check sidebar click first
                     if self.sidebar.visible {
@@ -701,6 +788,18 @@ impl App {
             }
 
             InputEvent::MouseRelease(mouse_event) => {
+                // Annotation mode mouse handling
+                if self.annotation_mode {
+                    if let Some(ref mut ann) = self.annotation {
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseRelease(mouse_event.clone())) {
+                            if redraw {
+                                self.needs_redraw = true;
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     if self.selecting_text {
                         // End text selection
@@ -722,6 +821,18 @@ impl App {
             }
 
             InputEvent::MouseMove(mouse_event) => {
+                // Annotation mode mouse handling
+                if self.annotation_mode {
+                    if let Some(ref mut ann) = self.annotation {
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseMove(mouse_event.clone())) {
+                            if redraw {
+                                self.needs_redraw = true;
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+
                 if self.mode == ViewMode::Image {
                     if self.selecting_text {
                         // Update text selection (use image coords)
@@ -1386,6 +1497,58 @@ impl App {
         Ok(())
     }
 
+    /// Toggle annotation mode
+    fn toggle_annotation_mode(&mut self) -> Result<()> {
+        if self.annotation_mode {
+            // Exit annotation mode
+            self.annotation_mode = false;
+            self.annotation = None;
+            tracing::info!("Exited annotation mode");
+        } else {
+            // Enter annotation mode - create annotation manager from current image
+            if let Some(rendered) = self.viewer.current_rendered_page() {
+                let ann = AnnotationManager::new(&rendered.data, rendered.width, rendered.height)?;
+                self.annotation = Some(ann);
+                self.annotation_mode = true;
+                tracing::info!("Entered annotation mode - use tools: b=brush, l=line, a=arrow, r=rect, e=ellipse, h=highlight");
+                tracing::info!("Colors: 1-9, Size: +/-, Fill: f, Undo: Ctrl+Z, Save: Ctrl+S, Exit: Esc");
+            } else {
+                tracing::warn!("Cannot enter annotation mode: no image loaded");
+            }
+        }
+        self.needs_redraw = true;
+        Ok(())
+    }
+
+    /// Save the annotated image
+    fn save_annotated_image(&mut self) -> Result<()> {
+        let ann = self.annotation.as_mut().context("No annotation in progress")?;
+
+        // Export annotated image
+        let data = ann.export()?;
+        let width = ann.canvas.width();
+        let height = ann.canvas.height();
+
+        // Determine output path
+        let input_path = self.viewer.current_path().context("No file loaded")?;
+        let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
+        let parent = input_path.parent().unwrap_or(Path::new("."));
+        let output_path = parent.join(format!("{}_annotated.png", stem));
+
+        // Save as PNG
+        let img = image::RgbaImage::from_raw(width, height, data)
+            .context("Failed to create image from annotation data")?;
+        img.save(&output_path).context("Failed to save annotated image")?;
+
+        tracing::info!("Saved annotated image to: {}", output_path.display());
+
+        // Exit annotation mode after saving
+        self.annotation_mode = false;
+        self.annotation = None;
+
+        Ok(())
+    }
+
     fn render(&mut self) -> Result<()> {
         let size = self.renderer.size();
         let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
@@ -1393,9 +1556,43 @@ impl App {
         // Clear background
         self.renderer.clear()?;
 
-        match self.mode {
-            ViewMode::Gallery => self.render_gallery(viewport_height)?,
-            ViewMode::Image => self.render_image(viewport_height)?,
+        // Annotation mode rendering
+        if self.annotation_mode {
+            if let Some(ref ann) = self.annotation {
+                // Render the annotation canvas
+                if let Err(e) = ann.render() {
+                    tracing::error!("Failed to render annotation: {}", e);
+                }
+
+                // Draw composite to window
+                let composite = ann.canvas.composite_surface();
+                let canvas_w = ann.canvas.width() as f64;
+                let canvas_h = ann.canvas.height() as f64;
+
+                // Center in viewport
+                let x = if canvas_w < size.width as f64 {
+                    (size.width as f64 - canvas_w) / 2.0
+                } else {
+                    0.0
+                };
+                let y = if canvas_h < viewport_height as f64 {
+                    (viewport_height as f64 - canvas_h) / 2.0
+                } else {
+                    0.0
+                };
+
+                let ctx = self.renderer.context()?;
+                ctx.set_source_surface(composite.cairo_surface(), x, y)?;
+                ctx.paint()?;
+
+                // Draw annotation toolbar at top
+                self.render_annotation_toolbar(&ctx, size.width, &ann)?;
+            }
+        } else {
+            match self.mode {
+                ViewMode::Gallery => self.render_gallery(viewport_height)?,
+                ViewMode::Image => self.render_image(viewport_height)?,
+            }
         }
 
         // Render status bar
@@ -2695,6 +2892,100 @@ impl App {
             self.viewer.scroll.offset_x = scroll.0;
             self.viewer.scroll.offset_y = scroll.1;
         }
+    }
+
+    /// Render the annotation toolbar at the top of the screen
+    fn render_annotation_toolbar(
+        &self,
+        ctx: &cairo::Context,
+        width: u32,
+        ann: &AnnotationManager,
+    ) -> Result<()> {
+        let toolbar_height = 40.0;
+        let padding = 10.0;
+
+        // Background
+        ctx.set_source_rgba(0.1, 0.1, 0.12, 0.95);
+        ctx.rectangle(0.0, 0.0, width as f64, toolbar_height);
+        ctx.fill()?;
+
+        // Border
+        ctx.set_source_rgb(0.3, 0.3, 0.35);
+        ctx.move_to(0.0, toolbar_height);
+        ctx.line_to(width as f64, toolbar_height);
+        ctx.stroke()?;
+
+        // Tool buttons
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(12.0);
+
+        let tools = ToolType::all();
+        let mut x = padding;
+
+        for tool in tools {
+            let is_active = ann.state.current_tool == *tool;
+            let label = format!("[{}] {}", tool.shortcut().to_ascii_uppercase(), tool.name());
+
+            // Background for active tool
+            if is_active {
+                ctx.set_source_rgba(0.3, 0.5, 0.8, 0.8);
+                ctx.rectangle(x - 4.0, 6.0, 70.0, 28.0);
+                ctx.fill()?;
+            }
+
+            // Text
+            ctx.set_source_rgb(if is_active { 1.0 } else { 0.7 }, if is_active { 1.0 } else { 0.7 }, if is_active { 1.0 } else { 0.7 });
+            ctx.move_to(x, 25.0);
+            ctx.show_text(&label)?;
+
+            x += 75.0;
+        }
+
+        // Separator
+        ctx.set_source_rgb(0.3, 0.3, 0.35);
+        ctx.move_to(x, 8.0);
+        ctx.line_to(x, 32.0);
+        ctx.stroke()?;
+        x += padding;
+
+        // Color preview
+        let color = &ann.state.properties.color;
+        ctx.set_source_rgba(color.r as f64, color.g as f64, color.b as f64, color.a as f64);
+        ctx.rectangle(x, 10.0, 20.0, 20.0);
+        ctx.fill()?;
+        ctx.set_source_rgb(0.5, 0.5, 0.5);
+        ctx.rectangle(x, 10.0, 20.0, 20.0);
+        ctx.stroke()?;
+        x += 30.0;
+
+        // Line width
+        ctx.set_source_rgb(0.7, 0.7, 0.7);
+        ctx.move_to(x, 25.0);
+        ctx.show_text(&format!("W:{:.0}", ann.state.properties.line_width))?;
+        x += 45.0;
+
+        // Fill mode
+        ctx.move_to(x, 25.0);
+        ctx.show_text(if ann.state.properties.fill { "[F]ill" } else { "[F]rame" })?;
+        x += 55.0;
+
+        // Undo/Redo status
+        ctx.set_source_rgb(0.5, 0.5, 0.5);
+        ctx.move_to(x, 25.0);
+        ctx.show_text(&format!("Undo:{} Redo:{}", ann.history.undo_count(), ann.history.redo_count()))?;
+
+        // Help text on right
+        ctx.set_source_rgb(0.5, 0.5, 0.5);
+        let help = "Esc:Exit  Ctrl+S:Save  1-9:Colors  +/-:Size";
+        let extents = ctx.text_extents(help)?;
+        ctx.move_to(width as f64 - extents.width() - padding, 25.0);
+        ctx.show_text(help)?;
+
+        Ok(())
     }
 }
 
