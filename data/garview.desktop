@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=garview
+GenericName=Image & Document Viewer
+Comment=View images, PDFs, comics, and ebooks
+Exec=garview %F
+Icon=garview
+Terminal=false
+Categories=Graphics;Viewer;Photography;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/svg+xml;image/x-icon;image/vnd.microsoft.icon;image/heic;image/heif;image/avif;application/pdf;application/epub+zip;application/x-cbz;application/x-cb7;application/vnd.comicbook+zip;application/vnd.comicbook-rar;
+Keywords=image;picture;photo;pdf;document;comic;ebook;epub;viewer;
+StartupNotify=true

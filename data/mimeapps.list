@@ -1,0 +1,41 @@
+# Install to ~/.config/mimeapps.list or merge with existing
+
+[Default Applications]
+image/jpeg=garview.desktop
+image/png=garview.desktop
+image/gif=garview.desktop
+image/webp=garview.desktop
+image/bmp=garview.desktop
+image/tiff=garview.desktop
+image/svg+xml=garview.desktop
+image/x-icon=garview.desktop
+image/vnd.microsoft.icon=garview.desktop
+image/heic=garview.desktop
+image/heif=garview.desktop
+image/avif=garview.desktop
+application/pdf=garview.desktop
+application/epub+zip=garview.desktop
+application/x-cbz=garview.desktop
+application/x-cb7=garview.desktop
+application/vnd.comicbook+zip=garview.desktop
+application/vnd.comicbook-rar=garview.desktop
+
+[Added Associations]
+image/jpeg=garview.desktop;
+image/png=garview.desktop;
+image/gif=garview.desktop;
+image/webp=garview.desktop;
+image/bmp=garview.desktop;
+image/tiff=garview.desktop;
+image/svg+xml=garview.desktop;
+image/x-icon=garview.desktop;
+image/vnd.microsoft.icon=garview.desktop;
+image/heic=garview.desktop;
+image/heif=garview.desktop;
+image/avif=garview.desktop;
+application/pdf=garview.desktop;
+application/epub+zip=garview.desktop;
+application/x-cbz=garview.desktop;
+application/x-cb7=garview.desktop;
+application/vnd.comicbook+zip=garview.desktop;
+application/vnd.comicbook-rar=garview.desktop;
