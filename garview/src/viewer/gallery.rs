@@ -8,6 +8,83 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "svg", "ico", "avif",
 ];
 
+/// Document extensions
+const DOCUMENT_EXTENSIONS: &[&str] = &["pdf"];
+
+/// Comic extensions
+const COMIC_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbt"];
+
+/// Ebook extensions
+const EBOOK_EXTENSIONS: &[&str] = &["epub"];
+
+/// Format filter for gallery
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FormatFilter {
+    /// Show all supported formats
+    #[default]
+    All,
+    /// Images only (png, jpg, gif, webp, etc.)
+    Images,
+    /// Documents only (pdf)
+    Documents,
+    /// Comics only (cbz, cb7, cbt)
+    Comics,
+    /// Ebooks only (epub)
+    Ebooks,
+}
+
+impl FormatFilter {
+    /// Get display name for the filter
+    pub fn name(&self) -> &'static str {
+        match self {
+            FormatFilter::All => "All",
+            FormatFilter::Images => "Images",
+            FormatFilter::Documents => "Documents",
+            FormatFilter::Comics => "Comics",
+            FormatFilter::Ebooks => "Ebooks",
+        }
+    }
+
+    /// Cycle to next filter
+    pub fn next(&self) -> Self {
+        match self {
+            FormatFilter::All => FormatFilter::Images,
+            FormatFilter::Images => FormatFilter::Documents,
+            FormatFilter::Documents => FormatFilter::Comics,
+            FormatFilter::Comics => FormatFilter::Ebooks,
+            FormatFilter::Ebooks => FormatFilter::All,
+        }
+    }
+
+    /// Cycle to previous filter
+    pub fn prev(&self) -> Self {
+        match self {
+            FormatFilter::All => FormatFilter::Ebooks,
+            FormatFilter::Images => FormatFilter::All,
+            FormatFilter::Documents => FormatFilter::Images,
+            FormatFilter::Comics => FormatFilter::Documents,
+            FormatFilter::Ebooks => FormatFilter::Comics,
+        }
+    }
+
+    /// Check if an extension matches this filter
+    pub fn matches(&self, ext: &str) -> bool {
+        let ext = ext.to_lowercase();
+        match self {
+            FormatFilter::All => {
+                IMAGE_EXTENSIONS.contains(&ext.as_str())
+                    || DOCUMENT_EXTENSIONS.contains(&ext.as_str())
+                    || COMIC_EXTENSIONS.contains(&ext.as_str())
+                    || EBOOK_EXTENSIONS.contains(&ext.as_str())
+            }
+            FormatFilter::Images => IMAGE_EXTENSIONS.contains(&ext.as_str()),
+            FormatFilter::Documents => DOCUMENT_EXTENSIONS.contains(&ext.as_str()),
+            FormatFilter::Comics => COMIC_EXTENSIONS.contains(&ext.as_str()),
+            FormatFilter::Ebooks => EBOOK_EXTENSIONS.contains(&ext.as_str()),
+        }
+    }
+}
+
 /// Sort order for gallery
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -25,11 +102,13 @@ pub enum SortOrder {
 pub struct GalleryView {
     /// Directory being viewed
     directory: Option<PathBuf>,
-    /// List of image files
-    files: Vec<FileEntry>,
+    /// All files in directory (unfiltered)
+    all_files: Vec<FileEntry>,
+    /// Filtered list of files (indices into all_files)
+    filtered_indices: Vec<usize>,
     /// Thumbnail cache
     cache: ThumbnailCache,
-    /// Current selection index
+    /// Current selection index (into filtered_indices)
     selection: usize,
     /// Scroll offset (in pixels)
     scroll_offset: f64,
@@ -39,6 +118,8 @@ pub struct GalleryView {
     cell_size: u32,
     /// Current sort order
     sort_order: SortOrder,
+    /// Current format filter
+    format_filter: FormatFilter,
     /// Thumbnail surfaces (rendered from cache data)
     surfaces: std::collections::HashMap<PathBuf, Surface>,
 }
@@ -59,13 +140,15 @@ impl GalleryView {
 
         Ok(Self {
             directory: None,
-            files: Vec::new(),
+            all_files: Vec::new(),
+            filtered_indices: Vec::new(),
             cache,
             selection: 0,
             scroll_offset: 0.0,
             columns: 4,
             cell_size: THUMBNAIL_SIZE + 16, // thumbnail + padding
             sort_order: SortOrder::default(),
+            format_filter: FormatFilter::default(),
             surfaces: std::collections::HashMap::new(),
         })
     }
@@ -77,7 +160,8 @@ impl GalleryView {
         }
 
         self.directory = Some(path.to_path_buf());
-        self.files.clear();
+        self.all_files.clear();
+        self.filtered_indices.clear();
         self.surfaces.clear();
         self.selection = 0;
         self.scroll_offset = 0.0;
@@ -88,13 +172,16 @@ impl GalleryView {
         // Apply current sort
         self.apply_sort();
 
+        // Apply filter
+        self.apply_filter();
+
         // Request thumbnails for visible items
         self.request_visible_thumbnails(0, 800); // Initial viewport
 
         Ok(())
     }
 
-    /// Scan directory for image files
+    /// Scan directory for supported files
     fn scan_directory(&mut self, path: &Path) -> Result<()> {
         let entries = std::fs::read_dir(path)?;
 
@@ -111,14 +198,15 @@ impl GalleryView {
                 .map(|e| e.to_lowercase());
 
             if let Some(ext) = ext {
-                if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+                // Check if it's any supported format
+                if FormatFilter::All.matches(&ext) {
                     if let Ok(metadata) = entry.metadata() {
                         let name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
 
-                        self.files.push(FileEntry {
+                        self.all_files.push(FileEntry {
                             path,
                             name,
                             size: metadata.len(),
@@ -132,15 +220,38 @@ impl GalleryView {
         Ok(())
     }
 
+    /// Apply current filter to rebuild filtered_indices
+    fn apply_filter(&mut self) {
+        self.filtered_indices.clear();
+
+        for (i, file) in self.all_files.iter().enumerate() {
+            let ext = file
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+
+            if self.format_filter.matches(ext) {
+                self.filtered_indices.push(i);
+            }
+        }
+
+        // Reset selection if out of bounds
+        if self.selection >= self.filtered_indices.len() {
+            self.selection = 0;
+        }
+        self.scroll_offset = 0.0;
+    }
+
     /// Apply current sort order
     fn apply_sort(&mut self) {
         match self.sort_order {
-            SortOrder::Name => self.files.sort_by(|a, b| a.name.cmp(&b.name)),
-            SortOrder::NameDesc => self.files.sort_by(|a, b| b.name.cmp(&a.name)),
-            SortOrder::Date => self.files.sort_by(|a, b| a.modified.cmp(&b.modified)),
-            SortOrder::DateDesc => self.files.sort_by(|a, b| b.modified.cmp(&a.modified)),
-            SortOrder::Size => self.files.sort_by(|a, b| a.size.cmp(&b.size)),
-            SortOrder::SizeDesc => self.files.sort_by(|a, b| b.size.cmp(&a.size)),
+            SortOrder::Name => self.all_files.sort_by(|a, b| a.name.cmp(&b.name)),
+            SortOrder::NameDesc => self.all_files.sort_by(|a, b| b.name.cmp(&a.name)),
+            SortOrder::Date => self.all_files.sort_by(|a, b| a.modified.cmp(&b.modified)),
+            SortOrder::DateDesc => self.all_files.sort_by(|a, b| b.modified.cmp(&a.modified)),
+            SortOrder::Size => self.all_files.sort_by(|a, b| a.size.cmp(&b.size)),
+            SortOrder::SizeDesc => self.all_files.sort_by(|a, b| b.size.cmp(&a.size)),
         }
     }
 
@@ -149,7 +260,31 @@ impl GalleryView {
         if self.sort_order != order {
             self.sort_order = order;
             self.apply_sort();
+            self.apply_filter(); // Re-apply filter after sort
         }
+    }
+
+    /// Set format filter
+    pub fn set_filter(&mut self, filter: FormatFilter) {
+        if self.format_filter != filter {
+            self.format_filter = filter;
+            self.apply_filter();
+        }
+    }
+
+    /// Cycle to next filter
+    pub fn next_filter(&mut self) {
+        self.set_filter(self.format_filter.next());
+    }
+
+    /// Cycle to previous filter
+    pub fn prev_filter(&mut self) {
+        self.set_filter(self.format_filter.prev());
+    }
+
+    /// Get current format filter
+    pub fn format_filter(&self) -> FormatFilter {
+        self.format_filter
     }
 
     /// Get current sort order
@@ -168,10 +303,11 @@ impl GalleryView {
         let start_row = (self.scroll_offset as u32 / self.cell_size) as usize;
         let visible_rows = (viewport_height / self.cell_size) as usize + 2;
         let start_idx = start_row * self.columns;
-        let end_idx = ((start_row + visible_rows) * self.columns).min(self.files.len());
+        let end_idx = ((start_row + visible_rows) * self.columns).min(self.filtered_indices.len());
 
         for i in start_idx..end_idx {
-            let path = &self.files[i].path;
+            let file_idx = self.filtered_indices[i];
+            let path = &self.all_files[file_idx].path;
 
             // Skip if we already have a surface
             if self.surfaces.contains_key(path) {
@@ -234,11 +370,12 @@ impl GalleryView {
         for row in start_row..(start_row + visible_rows) {
             for col in 0..self.columns {
                 let idx = row * self.columns + col;
-                if idx >= self.files.len() {
+                if idx >= self.filtered_indices.len() {
                     break;
                 }
 
-                let file = &self.files[idx];
+                let file_idx = self.filtered_indices[idx];
+                let file = &self.all_files[file_idx];
                 let x = col as f64 * cell + padding;
                 let y = row as f64 * cell - self.scroll_offset + padding;
 
@@ -291,7 +428,7 @@ impl GalleryView {
 
     /// Navigate selection
     pub fn select_next(&mut self) {
-        if self.selection < self.files.len().saturating_sub(1) {
+        if self.selection < self.filtered_indices.len().saturating_sub(1) {
             self.selection += 1;
             self.ensure_visible();
         }
@@ -306,7 +443,7 @@ impl GalleryView {
 
     pub fn select_down(&mut self) {
         let new_sel = self.selection + self.columns;
-        if new_sel < self.files.len() {
+        if new_sel < self.filtered_indices.len() {
             self.selection = new_sel;
             self.ensure_visible();
         }
@@ -338,7 +475,7 @@ impl GalleryView {
         self.scroll_offset = (self.scroll_offset + delta).max(0.0);
 
         // Clamp to content height
-        let total_rows = (self.files.len() + self.columns - 1) / self.columns;
+        let total_rows = (self.filtered_indices.len() + self.columns - 1) / self.columns;
         let content_height = total_rows as f64 * self.cell_size as f64;
         let max_scroll = (content_height - viewport_height as f64).max(0.0);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
@@ -346,12 +483,19 @@ impl GalleryView {
 
     /// Get selected file path
     pub fn selected_path(&self) -> Option<&Path> {
-        self.files.get(self.selection).map(|f| f.path.as_path())
+        self.filtered_indices
+            .get(self.selection)
+            .map(|&idx| self.all_files[idx].path.as_path())
     }
 
-    /// Get file count
+    /// Get filtered file count
     pub fn file_count(&self) -> usize {
-        self.files.len()
+        self.filtered_indices.len()
+    }
+
+    /// Get total file count (unfiltered)
+    pub fn total_file_count(&self) -> usize {
+        self.all_files.len()
     }
 
     /// Get current selection index
@@ -359,10 +503,10 @@ impl GalleryView {
         self.selection
     }
 
-    /// Check if gallery is empty
+    /// Check if gallery is empty (no filtered files)
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.filtered_indices.is_empty()
     }
 
     /// Get directory path

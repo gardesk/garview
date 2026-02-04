@@ -36,6 +36,21 @@ impl StatusBar {
         zoom_mode: ZoomMode,
         position: Option<(usize, usize)>,
     ) -> anyhow::Result<()> {
+        self.render_with_filter(renderer, width, y, file_info, zoom_level, zoom_mode, position, None)
+    }
+
+    /// Render the status bar with optional filter indicator (for gallery mode)
+    pub fn render_with_filter(
+        &self,
+        renderer: &Renderer,
+        width: u32,
+        y: u32,
+        file_info: Option<&FileInfo>,
+        zoom_level: f64,
+        zoom_mode: ZoomMode,
+        position: Option<(usize, usize)>,
+        filter: Option<&str>,
+    ) -> anyhow::Result<()> {
         let rect = Rect::new(0, y as i32, width, self.height);
 
         // Background
@@ -62,7 +77,7 @@ impl StatusBar {
         // Approximate text height ~14px for 12pt font
         let text_y = y as f64 + (self.height as f64 - 14.0) / 2.0;
 
-        // Left side: file info
+        // Left side: file info or filter
         if let Some(info) = file_info {
             let left_text = format!(
                 "{} - {}x{} - {} - {}",
@@ -72,6 +87,9 @@ impl StatusBar {
                 info.format,
                 info.format_size()
             );
+            renderer.text(&left_text, padding, text_y, &text_style)?;
+        } else if let Some(filter_name) = filter {
+            let left_text = format!("Filter: {} (t/T to change)", filter_name);
             renderer.text(&left_text, padding, text_y, &text_style)?;
         }
 

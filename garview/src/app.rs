@@ -1249,6 +1249,18 @@ impl App {
                 self.needs_redraw = true;
             }
 
+            // Format filter
+            Key::Char('t') => {
+                // Cycle through format filters: All -> Images -> Documents -> Comics -> Ebooks
+                gallery.next_filter();
+                self.needs_redraw = true;
+            }
+            Key::Char('T') => {
+                // Reverse cycle through format filters
+                gallery.prev_filter();
+                self.needs_redraw = true;
+            }
+
             _ => {}
         }
     }
@@ -1748,33 +1760,37 @@ impl App {
         }
 
         // Render status bar
-        let (file_info, zoom_level, zoom_mode, position) = match self.mode {
+        match self.mode {
             ViewMode::Image => {
                 // For multi-page documents, show page position; otherwise show directory position
                 let pos = self.viewer.page_position()
                     .or_else(|| self.viewer.directory_position());
-                (
-                    self.viewer.file_info(),
+                self.statusbar.render(
+                    &self.renderer,
+                    size.width,
+                    viewport_height,
+                    self.viewer.file_info().as_ref(),
                     self.viewer.zoom.level,
                     self.viewer.zoom.mode,
                     pos,
-                )
+                )?;
             }
             ViewMode::Gallery => {
-                let pos = self.gallery.as_ref().map(|g| (g.selection_index() + 1, g.file_count()));
-                (None, 1.0, crate::viewer::ZoomMode::Fit, pos)
+                let (pos, filter_name) = self.gallery.as_ref()
+                    .map(|g| ((g.selection_index() + 1, g.file_count()), g.format_filter().name()))
+                    .unwrap_or(((0, 0), "All"));
+                self.statusbar.render_with_filter(
+                    &self.renderer,
+                    size.width,
+                    viewport_height,
+                    None,
+                    1.0,
+                    crate::viewer::ZoomMode::Fit,
+                    Some(pos),
+                    Some(filter_name),
+                )?;
             }
-        };
-
-        self.statusbar.render(
-            &self.renderer,
-            size.width,
-            viewport_height,
-            file_info.as_ref(),
-            zoom_level,
-            zoom_mode,
-            position,
-        )?;
+        }
 
         // Render sidebar if visible
         if self.sidebar.visible {
