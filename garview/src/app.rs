@@ -8,6 +8,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
 use crate::annotate::{AnnotationManager, ToolType};
 use crate::config::Config;
+use crate::ipc::{create_viewer_info, IpcCommand, IpcServer};
 use crate::recent::RecentFiles;
 use crate::ui::{Sidebar, StatusBar, ThumbnailData, STATUS_BAR_HEIGHT, SIDEBAR_WIDTH};
 use crate::backend::LinkDestination;
@@ -76,6 +77,8 @@ pub struct App {
     annotation: Option<AnnotationManager>,
     /// Annotation mode active
     annotation_mode: bool,
+    /// IPC server for garviewctl
+    ipc_server: Option<IpcServer>,
 }
 
 impl App {
@@ -198,6 +201,7 @@ impl App {
             properties_panel_active: false,
             annotation: None,
             annotation_mode: false,
+            ipc_server: IpcServer::start().ok(),
         })
     }
 
@@ -274,6 +278,21 @@ impl App {
                         }
                     }
                 }
+            }
+
+            // Poll IPC commands
+            // Collect commands first to avoid borrow conflicts
+            let mut ipc_commands = Vec::new();
+            if let Some(ref ipc) = self.ipc_server {
+                while let Some(cmd) = ipc.try_recv() {
+                    ipc_commands.push(cmd);
+                }
+            }
+            // Process commands
+            for (cmd, resp_tx) in ipc_commands {
+                let response = self.handle_ipc_command(cmd);
+                let _ = resp_tx.send(response);
+                self.needs_redraw = true;
             }
 
             // Render if needed
@@ -1495,6 +1514,139 @@ impl App {
 
         self.fullscreen = !self.fullscreen;
         Ok(())
+    }
+
+    /// Handle an IPC command
+    fn handle_ipc_command(&mut self, cmd: IpcCommand) -> garview_ipc::Response {
+        use garview_ipc::Response;
+
+        match cmd {
+            IpcCommand::Open(path) => {
+                self.save_current_session();
+                match self.viewer.load(&path) {
+                    Ok(()) => {
+                        self.recent_files.add(&path);
+                        let _ = self.recent_files.save();
+                        self.mode = ViewMode::Image;
+                        self.restore_session(&path);
+                        Response::ok_with_message(format!("Opened: {}", path.display()))
+                    }
+                    Err(e) => Response::error(format!("Failed to open: {}", e)),
+                }
+            }
+            IpcCommand::Close => {
+                self.save_current_session();
+                // No explicit close method - just acknowledge
+                Response::ok_with_message("File closed")
+            }
+            IpcCommand::Next => {
+                self.save_current_session();
+                match self.viewer.next_image() {
+                    Ok(_) => Response::ok(),
+                    Err(e) => Response::error(e.to_string()),
+                }
+            }
+            IpcCommand::Prev => {
+                self.save_current_session();
+                match self.viewer.prev_image() {
+                    Ok(_) => Response::ok(),
+                    Err(e) => Response::error(e.to_string()),
+                }
+            }
+            IpcCommand::First => {
+                self.save_current_session();
+                self.viewer.first_page();
+                Response::ok()
+            }
+            IpcCommand::Last => {
+                self.save_current_session();
+                self.viewer.last_page();
+                Response::ok()
+            }
+            IpcCommand::Goto(page) => {
+                if self.viewer.goto_page(page.saturating_sub(1)) {
+                    Response::ok()
+                } else {
+                    Response::error("Invalid page number")
+                }
+            }
+            IpcCommand::ZoomIn => {
+                self.viewer.zoom.zoom_in();
+                Response::ok()
+            }
+            IpcCommand::ZoomOut => {
+                self.viewer.zoom.zoom_out();
+                Response::ok()
+            }
+            IpcCommand::ZoomFit => {
+                self.viewer.zoom.mode = ZoomMode::Fit;
+                Response::ok()
+            }
+            IpcCommand::ZoomActual => {
+                self.viewer.zoom.mode = ZoomMode::OneToOne;
+                self.viewer.zoom.level = 1.0;
+                Response::ok()
+            }
+            IpcCommand::ZoomSet(level) => {
+                self.viewer.zoom.mode = ZoomMode::Custom(level / 100.0);
+                self.viewer.zoom.level = level / 100.0;
+                Response::ok()
+            }
+            IpcCommand::RotateCw => {
+                self.viewer.rotate_cw();
+                Response::ok()
+            }
+            IpcCommand::RotateCcw => {
+                self.viewer.rotate_ccw();
+                Response::ok()
+            }
+            IpcCommand::FlipH => {
+                self.viewer.flip_horizontal();
+                Response::ok()
+            }
+            IpcCommand::FlipV => {
+                self.viewer.flip_vertical();
+                Response::ok()
+            }
+            IpcCommand::Fullscreen => {
+                let _ = self.toggle_fullscreen();
+                Response::ok()
+            }
+            IpcCommand::Sidebar => {
+                self.sidebar.toggle();
+                Response::ok()
+            }
+            IpcCommand::SlideshowStart => {
+                self.slideshow.active = true;
+                self.slideshow.last_advance = std::time::Instant::now();
+                Response::ok_with_message("Slideshow started")
+            }
+            IpcCommand::SlideshowStop => {
+                self.slideshow.active = false;
+                Response::ok_with_message("Slideshow stopped")
+            }
+            IpcCommand::SlideshowInterval(seconds) => {
+                self.slideshow.interval = std::time::Duration::from_secs_f64(seconds);
+                Response::ok_with_message(format!("Slideshow interval: {}s", seconds))
+            }
+            IpcCommand::GetInfo => {
+                let info = create_viewer_info(
+                    self.viewer.current_path(),
+                    self.viewer.current_page() + 1, // 1-indexed for display
+                    self.viewer.page_count(),
+                    self.viewer.zoom.level,
+                    self.viewer.effective_size().map(|(w, h)| (w as u32, h as u32)),
+                    self.fullscreen,
+                    self.slideshow.active,
+                );
+                Response::ok_with_data(serde_json::to_value(info).unwrap_or_default())
+            }
+            IpcCommand::Quit => {
+                // This will be handled by returning false from handle_event
+                // For now, just acknowledge
+                Response::ok_with_message("Quitting...")
+            }
+        }
     }
 
     /// Toggle annotation mode

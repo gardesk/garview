@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["garview"]
-# TODO: Add garviewctl and garview-ipc in Sprint 7
+members = ["garview", "garview-ipc", "garviewctl"]
 
 [workspace.package]
 version = "0.1.0"
@@ -70,3 +69,9 @@ sevenz-rust = "0.6"
 
 # Ebooks
 epub = "2.1"
+
+# IPC
+garview-ipc = { path = "garview-ipc" }
+
+# Unix sockets
+libc = "0.2"

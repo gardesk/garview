@@ -6,6 +6,7 @@ mod app;
 mod backend;
 mod cache;
 mod config;
+mod ipc;
 mod recent;
 mod ui;
 mod viewer;

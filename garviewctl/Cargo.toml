@@ -1,0 +1,14 @@
+[package]
+name = "garviewctl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "garviewctl"
+path = "src/main.rs"
+
+[dependencies]
+garview-ipc = { path = "../garview-ipc" }
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

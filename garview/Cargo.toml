@@ -34,3 +34,7 @@ sevenz-rust.workspace = true
 
 # Ebooks
 epub.workspace = true
+
+# IPC
+garview-ipc.workspace = true
+libc.workspace = true
