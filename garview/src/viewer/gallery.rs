@@ -15,7 +15,7 @@ const DOCUMENT_EXTENSIONS: &[&str] = &["pdf"];
 const COMIC_EXTENSIONS: &[&str] = &["cbz", "cb7", "cbt"];
 
 /// Ebook extensions
-const EBOOK_EXTENSIONS: &[&str] = &["epub"];
+const EBOOK_EXTENSIONS: &[&str] = &["epub", "mobi", "azw", "azw3", "prc"];
 
 /// Format filter for gallery
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

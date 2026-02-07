@@ -38,3 +38,4 @@ epub.workspace = true
 # IPC
 garview-ipc.workspace = true
 libc.workspace = true
+mobi = "0.8.0"

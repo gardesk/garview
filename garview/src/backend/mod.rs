@@ -1,12 +1,14 @@
 mod comic;
 mod epub;
 mod image_backend;
+mod mobi;
 mod pdf;
 mod svg;
 
 pub use comic::ComicBackend;
 pub use epub::EpubBackend;
 pub use image_backend::ImageBackend;
+pub use mobi::MobiBackend;
 pub use pdf::PdfBackend;
 pub use svg::SvgBackend;
 
@@ -160,6 +162,11 @@ pub fn backend_for_path(path: &Path) -> Option<Box<dyn Backend>> {
     // Ebooks
     if ext == "epub" {
         return Some(Box::new(EpubBackend::new()));
+    }
+
+    // MOBI/AZW
+    if ext == "mobi" || ext == "azw" || ext == "azw3" || ext == "prc" {
+        return Some(Box::new(MobiBackend::new()));
     }
 
     // Images
