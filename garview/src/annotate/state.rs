@@ -1,7 +1,59 @@
 //! Annotation state machine and core types.
 
 use gartk_core::{Color, Rect};
-use std::time::SystemTime;
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Serializable annotation record for JSON persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableAnnotation {
+    pub id: u64,
+    pub tool: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub color: [f64; 4], // RGBA
+    pub page: usize,
+    pub timestamp: u64, // Seconds since epoch
+}
+
+impl SerializableAnnotation {
+    /// Convert from AnnotationRecord.
+    pub fn from_record(record: &AnnotationRecord) -> Self {
+        let timestamp = record.timestamp
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            id: record.id,
+            tool: record.tool.name().to_string(),
+            x: record.bounds.x,
+            y: record.bounds.y,
+            width: record.bounds.width,
+            height: record.bounds.height,
+            color: [record.color.r, record.color.g, record.color.b, record.color.a],
+            page: record.page,
+            timestamp,
+        }
+    }
+
+    /// Convert to AnnotationRecord.
+    pub fn to_record(&self) -> AnnotationRecord {
+        let tool = ToolType::from_name(&self.tool).unwrap_or_default();
+        let bounds = Rect::new(self.x, self.y, self.width, self.height);
+        let color = Color::new(self.color[0], self.color[1], self.color[2], self.color[3]);
+        let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(self.timestamp);
+        AnnotationRecord {
+            id: self.id,
+            tool,
+            bounds,
+            color,
+            page: self.page,
+            timestamp,
+        }
+    }
+}
 
 /// Record of a committed annotation.
 #[derive(Debug, Clone)]
@@ -79,6 +131,21 @@ impl ToolType {
             't' => Some(ToolType::Text),
             'x' => Some(ToolType::Blur),
             'h' => Some(ToolType::Highlight),
+            _ => None,
+        }
+    }
+
+    /// Get tool type from name string.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Brush" => Some(ToolType::Brush),
+            "Line" => Some(ToolType::Line),
+            "Arrow" => Some(ToolType::Arrow),
+            "Rectangle" => Some(ToolType::Rectangle),
+            "Ellipse" => Some(ToolType::Ellipse),
+            "Text" => Some(ToolType::Text),
+            "Blur" => Some(ToolType::Blur),
+            "Highlight" => Some(ToolType::Highlight),
             _ => None,
         }
     }

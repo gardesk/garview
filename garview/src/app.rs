@@ -401,15 +401,19 @@ impl App {
                                 self.annotation = None;
                                 self.needs_redraw = true;
                             }
-                            // Tool selection shortcuts
-                            Key::Char('b') => ann.select_tool(ToolType::Brush),
-                            Key::Char('l') => ann.select_tool(ToolType::Line),
-                            Key::Char('a') => ann.select_tool(ToolType::Arrow),
-                            Key::Char('r') => ann.select_tool(ToolType::Rectangle),
-                            Key::Char('e') => ann.select_tool(ToolType::Ellipse),
-                            Key::Char('t') => ann.select_tool(ToolType::Text),
-                            Key::Char('x') => ann.select_tool(ToolType::Blur),
-                            Key::Char('h') => ann.select_tool(ToolType::Highlight),
+                            // Tool selection shortcuts (only without Ctrl)
+                            Key::Char('b') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Brush),
+                            Key::Char('l') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Line),
+                            Key::Char('a') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Arrow),
+                            Key::Char('r') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Rectangle),
+                            Key::Char('e') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Ellipse),
+                            Key::Char('t') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Text),
+                            Key::Char('x') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Blur),
+                            Key::Char('h') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Highlight),
+                            // Exit annotation mode (Ctrl+A)
+                            Key::Char('a') if key_event.modifiers.ctrl => {
+                                self.toggle_annotation_mode()?;
+                            }
                             // Color presets (1-9)
                             Key::Char(c @ '1'..='9') => {
                                 let idx = (c as u8 - b'1') as usize;
@@ -1947,11 +1951,19 @@ impl App {
 
                 // Load existing annotations if they exist
                 if let Some(path) = self.viewer.current_path() {
+                    // Load raster annotations (PNG)
                     if let Ok(Some(data)) = AnnotationManager::load_annotations(path) {
                         if let Err(e) = ann.restore_from_data(&data) {
                             tracing::error!("Failed to restore annotations: {}", e);
                         } else {
-                            tracing::info!("Loaded existing annotations");
+                            tracing::info!("Loaded existing annotations (raster)");
+                        }
+                    }
+                    // Load annotation records (JSON)
+                    if let Ok(records) = AnnotationManager::load_annotation_records(path) {
+                        if !records.is_empty() {
+                            tracing::info!("Loaded {} annotation records", records.len());
+                            ann.restore_records(records);
                         }
                     }
                 }

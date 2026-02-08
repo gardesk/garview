@@ -9,7 +9,7 @@ pub mod tools;
 
 pub use canvas::AnnotationCanvas;
 pub use history::History;
-pub use state::{AnnotationRecord, AnnotationState, ToolType};
+pub use state::{AnnotationRecord, AnnotationState, SerializableAnnotation, ToolType};
 pub use tools::{create_tool, Tool};
 
 use anyhow::{Context, Result};
@@ -30,6 +30,8 @@ pub struct AnnotationManager {
     pub modified: bool,
     /// List of annotation records for sidebar display.
     annotations: Vec<AnnotationRecord>,
+    /// Redo stack for annotation records.
+    annotations_redo: Vec<AnnotationRecord>,
     /// Next annotation ID.
     next_id: u64,
     /// Current page (for multi-page documents).
@@ -51,6 +53,7 @@ impl AnnotationManager {
             history,
             modified: false,
             annotations: Vec::new(),
+            annotations_redo: Vec::new(),
             next_id: 1,
             current_page: 0,
         })
@@ -76,11 +79,20 @@ impl AnnotationManager {
         self.annotations.len()
     }
 
-    /// Get the sidecar annotation file path for a given file.
+    /// Get the sidecar annotation PNG file path for a given file.
     pub fn annotation_path(file_path: &Path) -> std::path::PathBuf {
         let mut path = file_path.to_path_buf();
         let mut name = path.file_name().unwrap_or_default().to_os_string();
         name.push(".annotations.png");
+        path.set_file_name(name);
+        path
+    }
+
+    /// Get the sidecar annotation JSON file path for a given file.
+    pub fn annotation_json_path(file_path: &Path) -> std::path::PathBuf {
+        let mut path = file_path.to_path_buf();
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".annotations.json");
         path.set_file_name(name);
         path
     }
@@ -103,9 +115,32 @@ impl AnnotationManager {
         Ok(Some(rgba.into_raw()))
     }
 
-    /// Save annotations to sidecar file.
+    /// Load annotation records from JSON sidecar file.
+    pub fn load_annotation_records(file_path: &Path) -> Result<Vec<AnnotationRecord>> {
+        let json_path = Self::annotation_json_path(file_path);
+        if !json_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = std::fs::read_to_string(&json_path)
+            .with_context(|| format!("Failed to read {:?}", json_path))?;
+        let records: Vec<state::SerializableAnnotation> = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {:?}", json_path))?;
+        Ok(records.into_iter().map(|r| r.to_record()).collect())
+    }
+
+    /// Restore annotation records from loaded data.
+    pub fn restore_records(&mut self, records: Vec<AnnotationRecord>) {
+        // Find the max ID to continue from
+        let max_id = records.iter().map(|r| r.id).max().unwrap_or(0);
+        self.next_id = max_id + 1;
+        self.annotations = records;
+    }
+
+    /// Save annotations to sidecar files (PNG + JSON).
     pub fn save_annotations(&mut self, file_path: &Path) -> Result<()> {
         let ann_path = Self::annotation_path(file_path);
+        let json_path = Self::annotation_json_path(file_path);
         let data = self.canvas.snapshot_annotations()?;
         let width = self.canvas.width();
         let height = self.canvas.height();
@@ -113,9 +148,12 @@ impl AnnotationManager {
         // Check if annotations are empty (all transparent)
         let is_empty = data.chunks(4).all(|px| px[3] == 0);
         if is_empty {
-            // Delete sidecar file if it exists and annotations are empty
+            // Delete sidecar files if they exist and annotations are empty
             if ann_path.exists() {
                 std::fs::remove_file(&ann_path)?;
+            }
+            if json_path.exists() {
+                std::fs::remove_file(&json_path)?;
             }
             self.modified = false;
             return Ok(());
@@ -130,8 +168,18 @@ impl AnnotationManager {
             image::ColorType::Rgba8,
         ).with_context(|| format!("Failed to save annotations to {:?}", ann_path))?;
 
+        // Save annotation records as JSON
+        let records: Vec<state::SerializableAnnotation> = self.annotations
+            .iter()
+            .map(state::SerializableAnnotation::from_record)
+            .collect();
+        let json = serde_json::to_string_pretty(&records)
+            .context("Failed to serialize annotation records")?;
+        std::fs::write(&json_path, json)
+            .with_context(|| format!("Failed to write {:?}", json_path))?;
+
         self.modified = false;
-        tracing::info!("Saved annotations to {:?}", ann_path);
+        tracing::info!("Saved annotations to {:?} and {:?}", ann_path, json_path);
         Ok(())
     }
 
@@ -165,6 +213,9 @@ impl AnnotationManager {
 
     /// Commit the current tool drawing.
     pub fn commit_current(&mut self) -> Result<()> {
+        // Clear redo stack on new action
+        self.annotations_redo.clear();
+
         // Record annotation metadata before committing
         if let Some(bounds) = self.tool.bounds() {
             let record = AnnotationRecord::new(
@@ -214,8 +265,10 @@ impl AnnotationManager {
         let current = self.canvas.snapshot_annotations()?;
         if let Some(previous) = self.history.undo(current) {
             self.canvas.restore_annotations(&previous)?;
-            // Remove the last annotation record
-            self.annotations.pop();
+            // Move the last annotation record to redo stack
+            if let Some(record) = self.annotations.pop() {
+                self.annotations_redo.push(record);
+            }
             self.modified = true;
             Ok(true)
         } else {
@@ -228,6 +281,10 @@ impl AnnotationManager {
         let current = self.canvas.snapshot_annotations()?;
         if let Some(next) = self.history.redo(current) {
             self.canvas.restore_annotations(&next)?;
+            // Restore the annotation record from redo stack
+            if let Some(record) = self.annotations_redo.pop() {
+                self.annotations.push(record);
+            }
             self.modified = true;
             Ok(true)
         } else {
@@ -262,7 +319,9 @@ impl AnnotationManager {
         self.history.push(snapshot);
 
         self.canvas.clear_annotations()?;
+        // Clear both stacks (can't properly undo/redo records for bulk clear)
         self.annotations.clear();
+        self.annotations_redo.clear();
         self.tool.reset();
         self.modified = true;
 
