@@ -463,6 +463,8 @@ impl App {
                                             tracing::error!("Failed to set form field value: {}", e);
                                         }
                                     }
+                                    // Invalidate cache so poppler re-renders with new value
+                                    self.viewer.invalidate_page_cache();
                                 }
                                 self.needs_redraw = true;
                             }
@@ -472,6 +474,8 @@ impl App {
                                     if let Some(backend) = self.viewer.backend_mut() {
                                         let _ = backend.set_form_field_value(field_id, value);
                                     }
+                                    // Invalidate cache so poppler re-renders with new value
+                                    self.viewer.invalidate_page_cache();
                                 }
                                 if key_event.modifiers.shift {
                                     form_state.focus_prev();
@@ -514,6 +518,8 @@ impl App {
                                                 if let Some(backend) = self.viewer.backend_mut() {
                                                     let _ = backend.set_form_field_value(field_id, value);
                                                 }
+                                                // Invalidate cache so poppler re-renders with new state
+                                                self.viewer.invalidate_page_cache();
                                             }
                                         }
                                         crate::forms::FormFieldType::Text { .. } => {
@@ -946,6 +952,7 @@ impl App {
                                             if let Some(backend) = self.viewer.backend_mut() {
                                                 let _ = backend.set_form_field_value(fid, value);
                                             }
+                                            self.viewer.invalidate_page_cache();
                                         }
                                     }
                                 }
@@ -968,6 +975,7 @@ impl App {
                                                     if let Some(backend) = self.viewer.backend_mut() {
                                                         let _ = backend.set_form_field_value(fid, value);
                                                     }
+                                                    self.viewer.invalidate_page_cache();
                                                 }
                                             }
                                             self.last_form_click = None;
@@ -994,6 +1002,8 @@ impl App {
                                             if let Some(backend) = self.viewer.backend_mut() {
                                                 let _ = backend.set_form_field_value(fid, value);
                                             }
+                                            // Invalidate cache so poppler re-renders with new value
+                                            self.viewer.invalidate_page_cache();
                                         }
                                         self.last_form_click = None;
                                         self.needs_redraw = true;
