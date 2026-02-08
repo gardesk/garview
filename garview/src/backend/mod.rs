@@ -124,6 +124,30 @@ pub trait Backend {
     fn get_links(&self, _page: usize) -> Vec<((f64, f64, f64, f64), LinkDestination)> {
         Vec::new()
     }
+
+    /// Does this backend support form fields?
+    fn supports_forms(&self) -> bool {
+        false
+    }
+
+    /// Get form fields on a page
+    fn get_form_fields(&self, _page: usize) -> Vec<crate::forms::FormFieldInfo> {
+        Vec::new()
+    }
+
+    /// Set a form field value
+    fn set_form_field_value(
+        &mut self,
+        _field_id: i32,
+        _value: crate::forms::FormFieldValue,
+    ) -> Result<()> {
+        anyhow::bail!("Form fields not supported by this backend")
+    }
+
+    /// Save the document (with form field changes)
+    fn save_document(&self, _path: &Path) -> Result<()> {
+        anyhow::bail!("Save not supported by this backend")
+    }
 }
 
 /// Link destination type
