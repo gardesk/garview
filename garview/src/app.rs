@@ -2683,12 +2683,14 @@ impl App {
                                 let char_width = rect_w / (*max as f64);
                                 rect_x + (cursor_pos as f64 * char_width)
                             } else {
+                                // Use x_advance to properly measure trailing spaces
                                 let cursor_text = &form_state.text_buffer[..cursor_pos];
-                                rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.width()
+                                rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
                             }
                         } else {
+                            // Use x_advance to properly measure trailing spaces
                             let cursor_text = &form_state.text_buffer[..cursor_pos];
-                            rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.width()
+                            rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
                         };
                         ctx.set_source_rgba(0.0, 0.0, 0.0, 0.8);
                         ctx.set_line_width(1.0);
