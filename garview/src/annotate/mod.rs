@@ -119,13 +119,16 @@ impl AnnotationManager {
     pub fn load_annotation_records(file_path: &Path) -> Result<Vec<AnnotationRecord>> {
         let json_path = Self::annotation_json_path(file_path);
         if !json_path.exists() {
+            tracing::debug!("No annotation JSON file at {:?}", json_path);
             return Ok(Vec::new());
         }
 
+        tracing::debug!("Loading annotation records from {:?}", json_path);
         let content = std::fs::read_to_string(&json_path)
             .with_context(|| format!("Failed to read {:?}", json_path))?;
         let records: Vec<state::SerializableAnnotation> = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse {:?}", json_path))?;
+        tracing::debug!("Parsed {} annotation records", records.len());
         Ok(records.into_iter().map(|r| r.to_record()).collect())
     }
 

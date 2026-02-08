@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
-use crate::annotate::{AnnotationManager, ToolType};
+use crate::annotate::{AnnotationManager, AnnotationRecord, ToolType};
 use crate::config::Config;
 use crate::forms::FormState;
 use crate::ipc::{create_viewer_info, IpcCommand, IpcServer};
@@ -79,6 +79,10 @@ pub struct App {
     annotation: Option<AnnotationManager>,
     /// Annotation mode active
     annotation_mode: bool,
+    /// Persistent annotation records (shown in sidebar even when not in annotation mode)
+    annotation_records: Vec<AnnotationRecord>,
+    /// Annotation layer data for overlay (RGBA, width, height)
+    annotation_overlay: Option<(Vec<u8>, u32, u32)>,
     /// IPC server for garviewctl
     ipc_server: Option<IpcServer>,
     /// PDF form state
@@ -207,6 +211,8 @@ impl App {
             properties_panel_active: false,
             annotation: None,
             annotation_mode: false,
+            annotation_records: Vec::new(),
+            annotation_overlay: None,
             ipc_server: IpcServer::start().ok(),
             form_state: None,
             last_form_click: None,
@@ -230,6 +236,7 @@ impl App {
 
         // Load form fields for initial document (if any)
         self.load_form_fields();
+                        self.load_annotations_for_current_file();
 
         event_loop.run(|event_loop, event| {
             // Handle event (errors are logged, not propagated)
@@ -358,6 +365,7 @@ impl App {
                             self.mode = ViewMode::Image;
                             self.restore_session(&path);
                             self.load_form_fields();
+                        self.load_annotations_for_current_file();
                         }
                         break; // Only open the first file
                     } else if path.is_dir() {
@@ -628,6 +636,7 @@ impl App {
                                             self.mode = ViewMode::Image;
                                             self.restore_session(&path);
                                             self.load_form_fields();
+                        self.load_annotations_for_current_file();
                                         }
                                     }
                                     Ok(None) => {
@@ -653,6 +662,7 @@ impl App {
                                         self.mode = ViewMode::Image;
                                         self.restore_session(&path);
                                         self.load_form_fields();
+                        self.load_annotations_for_current_file();
                                     }
                                 }
                                 self.recent_panel_active = false;
@@ -920,8 +930,14 @@ impl App {
             InputEvent::MousePress(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // Compute offset before mutable borrow
+                    let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MousePress(mouse_event.clone())) {
+                        // Transform coordinates from window to canvas space
+                        let mut transformed = mouse_event.clone();
+                        transformed.position.x -= offset.0;
+                        transformed.position.y -= offset.1;
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MousePress(transformed)) {
                             if redraw {
                                 self.needs_redraw = true;
                             }
@@ -933,7 +949,12 @@ impl App {
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     // Check sidebar click first
                     if self.sidebar.visible {
-                        let annotations = self.annotation.as_ref().map(|a| a.annotations()).unwrap_or(&[]);
+                        // Use persistent records (from annotation manager when active, or pre-loaded)
+                        let annotations: &[AnnotationRecord] = if let Some(ref ann) = self.annotation {
+                            ann.annotations()
+                        } else {
+                            &self.annotation_records
+                        };
                         if let Some(page) = self.sidebar.handle_click(
                             mouse_event.position.x as f64,
                             mouse_event.position.y as f64,
@@ -1072,8 +1093,14 @@ impl App {
             InputEvent::MouseRelease(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // Compute offset before mutable borrow
+                    let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseRelease(mouse_event.clone())) {
+                        // Transform coordinates from window to canvas space
+                        let mut transformed = mouse_event.clone();
+                        transformed.position.x -= offset.0;
+                        transformed.position.y -= offset.1;
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseRelease(transformed)) {
                             if redraw {
                                 self.needs_redraw = true;
                             }
@@ -1105,8 +1132,14 @@ impl App {
             InputEvent::MouseMove(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // Compute offset before mutable borrow
+                    let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseMove(mouse_event.clone())) {
+                        // Transform coordinates from window to canvas space
+                        let mut transformed = mouse_event.clone();
+                        transformed.position.x -= offset.0;
+                        transformed.position.y -= offset.1;
+                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseMove(transformed)) {
                             if redraw {
                                 self.needs_redraw = true;
                             }
@@ -1484,6 +1517,7 @@ impl App {
                         // Restore session for the newly loaded file
                         self.restore_session(&path);
                         self.load_form_fields();
+                        self.load_annotations_for_current_file();
                     }
                 }
                 self.needs_redraw = true;
@@ -1807,6 +1841,7 @@ impl App {
                         self.mode = ViewMode::Image;
                         self.restore_session(&path);
                         self.load_form_fields();
+                        self.load_annotations_for_current_file();
                         Response::ok_with_message(format!("Opened: {}", path.display()))
                     }
                     Err(e) => Response::error(format!("Failed to open: {}", e)),
@@ -1930,7 +1965,7 @@ impl App {
     /// Toggle annotation mode
     fn toggle_annotation_mode(&mut self) -> Result<()> {
         if self.annotation_mode {
-            // Exit annotation mode - save if modified
+            // Exit annotation mode - save if modified and sync records
             if let Some(ref mut ann) = self.annotation {
                 if ann.modified {
                     if let Some(path) = self.viewer.current_path() {
@@ -1940,9 +1975,13 @@ impl App {
                         }
                     }
                 }
+                // Sync records to persistent storage for sidebar
+                self.annotation_records = ann.annotations().to_vec();
             }
             self.annotation_mode = false;
             self.annotation = None;
+            // Reload overlay from saved file
+            self.load_annotations_for_current_file();
             tracing::info!("Exited annotation mode");
         } else {
             // Enter annotation mode - create annotation manager from current image
@@ -1951,19 +1990,37 @@ impl App {
 
                 // Load existing annotations if they exist
                 if let Some(path) = self.viewer.current_path() {
-                    // Load raster annotations (PNG)
-                    if let Ok(Some(data)) = AnnotationManager::load_annotations(path) {
+                    // Use pre-loaded overlay if available, otherwise load from file
+                    if let Some((ref data, _, _)) = self.annotation_overlay {
+                        if let Err(e) = ann.restore_from_data(data) {
+                            tracing::error!("Failed to restore annotations: {}", e);
+                        } else {
+                            tracing::info!("Loaded existing annotations from overlay");
+                        }
+                    } else if let Ok(Some(data)) = AnnotationManager::load_annotations(path) {
                         if let Err(e) = ann.restore_from_data(&data) {
                             tracing::error!("Failed to restore annotations: {}", e);
                         } else {
                             tracing::info!("Loaded existing annotations (raster)");
                         }
                     }
-                    // Load annotation records (JSON)
-                    if let Ok(records) = AnnotationManager::load_annotation_records(path) {
-                        if !records.is_empty() {
-                            tracing::info!("Loaded {} annotation records", records.len());
-                            ann.restore_records(records);
+
+                    // Use pre-loaded records if available, otherwise load from file
+                    if !self.annotation_records.is_empty() {
+                        tracing::info!("Restored {} annotation records from cache", self.annotation_records.len());
+                        ann.restore_records(self.annotation_records.clone());
+                    } else {
+                        match AnnotationManager::load_annotation_records(path) {
+                            Ok(records) if !records.is_empty() => {
+                                tracing::info!("Loaded {} annotation records", records.len());
+                                ann.restore_records(records);
+                            }
+                            Ok(_) => {
+                                // Empty or no JSON file
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to load annotation records: {}", e);
+                            }
                         }
                     }
                 }
@@ -1978,6 +2035,33 @@ impl App {
         }
         self.needs_redraw = true;
         Ok(())
+    }
+
+    /// Get the offset of the annotation canvas from window origin.
+    fn annotation_canvas_offset(&self) -> (i32, i32) {
+        if let Some(ref ann) = self.annotation {
+            let size = self.renderer.size();
+            let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
+
+            let canvas_w = ann.canvas.width() as f64;
+            let canvas_h = ann.canvas.height() as f64;
+
+            // Calculate centering offset (same as in render)
+            let offset_x = if canvas_w < size.width as f64 {
+                (size.width as f64 - canvas_w) / 2.0
+            } else {
+                0.0
+            };
+            let offset_y = if canvas_h < viewport_height as f64 {
+                (viewport_height as f64 - canvas_h) / 2.0
+            } else {
+                0.0
+            };
+
+            (offset_x as i32, offset_y as i32)
+        } else {
+            (0, 0)
+        }
     }
 
     /// Save annotations to sidecar file
@@ -2108,11 +2192,36 @@ impl App {
         };
 
         if let Some(rendered) = self.viewer.current_rendered_page() {
-            let img = image::RgbaImage::from_raw(
+            let mut img = image::RgbaImage::from_raw(
                 rendered.width,
                 rendered.height,
                 rendered.data,
             ).context("Failed to create image from rendered data")?;
+
+            // Composite annotation overlay if present
+            // First check if we're in annotation mode (get live annotations)
+            if self.annotation_mode {
+                if let Some(ref mut ann) = self.annotation {
+                    if let Ok(ann_data) = ann.canvas.snapshot_annotations() {
+                        if let Some(overlay) = image::RgbaImage::from_raw(
+                            ann.canvas.width(),
+                            ann.canvas.height(),
+                            ann_data,
+                        ) {
+                            image::imageops::overlay(&mut img, &overlay, 0, 0);
+                        }
+                    }
+                }
+            } else if let Some((ref overlay_data, overlay_w, overlay_h)) = self.annotation_overlay {
+                // Use pre-loaded overlay when not in annotation mode
+                if let Some(overlay) = image::RgbaImage::from_raw(
+                    overlay_w,
+                    overlay_h,
+                    overlay_data.clone(),
+                ) {
+                    image::imageops::overlay(&mut img, &overlay, 0, 0);
+                }
+            }
 
             if ext == "jpg" {
                 // Convert to RGB for JPEG
@@ -2215,7 +2324,12 @@ impl App {
 
         // Render sidebar if visible
         if self.sidebar.visible {
-            let annotations = self.annotation.as_ref().map(|a| a.annotations()).unwrap_or(&[]);
+            // Use persistent records (from annotation manager when active, or pre-loaded)
+            let annotations: &[AnnotationRecord] = if let Some(ref ann) = self.annotation {
+                ann.annotations()
+            } else {
+                &self.annotation_records
+            };
             self.sidebar.render(&self.renderer, viewport_height, annotations)?;
         }
 
@@ -2353,6 +2467,16 @@ impl App {
                 };
                 ctx.source().set_filter(filter);
                 ctx.paint()?;
+
+                // Draw annotation overlay (when not in annotation mode)
+                if !self.annotation_mode {
+                    if let Some((ref overlay_data, overlay_w, overlay_h)) = self.annotation_overlay {
+                        if let Ok(overlay_surface) = gartk_render::Surface::from_rgba(overlay_data, overlay_w, overlay_h) {
+                            ctx.set_source_surface(overlay_surface.cairo_surface(), 0.0, 0.0)?;
+                            ctx.paint()?;
+                        }
+                    }
+                }
 
                 ctx.restore()?;
 
@@ -3713,6 +3837,48 @@ impl App {
             if state.has_fields() {
                 tracing::info!("Loaded {} form fields", state.fields.len());
                 self.form_state = Some(state);
+            }
+        }
+    }
+
+    /// Load annotation overlay and records for the current file.
+    fn load_annotations_for_current_file(&mut self) {
+        // Clear previous annotations
+        self.annotation_records.clear();
+        self.annotation_overlay = None;
+
+        if let Some(path) = self.viewer.current_path() {
+            let path = path.to_path_buf();
+
+            // Load annotation PNG overlay
+            match AnnotationManager::load_annotations(&path) {
+                Ok(Some(data)) => {
+                    // Get dimensions from current rendered page
+                    if let Some(rendered) = self.viewer.current_rendered_page() {
+                        self.annotation_overlay = Some((data, rendered.width, rendered.height));
+                        tracing::debug!("Loaded annotation overlay for {:?}", path);
+                    }
+                }
+                Ok(None) => {
+                    // No annotations file exists
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load annotation overlay: {}", e);
+                }
+            }
+
+            // Load annotation records (JSON)
+            match AnnotationManager::load_annotation_records(&path) {
+                Ok(records) if !records.is_empty() => {
+                    tracing::info!("Loaded {} annotation records for sidebar", records.len());
+                    self.annotation_records = records;
+                }
+                Ok(_) => {
+                    // No records or empty file
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load annotation records: {}", e);
+                }
             }
         }
     }
