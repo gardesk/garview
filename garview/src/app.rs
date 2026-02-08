@@ -412,7 +412,57 @@ impl App {
             }
 
             InputEvent::Key(key_event) if key_event.pressed => {
-                // Handle annotation mode input first
+                // Export dialog takes priority over everything when active
+                if self.export_dialog_active {
+                    match key_event.key {
+                        Key::Escape => {
+                            self.export_dialog_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Return => {
+                            let format = match self.export_dialog_selected {
+                                0 => "png",
+                                1 => "jpeg",
+                                2 => "pdf",
+                                _ => "png",
+                            };
+                            self.export_dialog_active = false;
+                            match self.export_current_page(format) {
+                                Ok(()) => {}
+                                Err(e) => tracing::error!("Export failed: {}", e),
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Up | Key::Char('k') => {
+                            if self.export_dialog_selected > 0 {
+                                self.export_dialog_selected -= 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Down | Key::Char('j') => {
+                            if self.export_dialog_selected < 2 {
+                                self.export_dialog_selected += 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('1') => {
+                            self.export_dialog_selected = 0;
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('2') => {
+                            self.export_dialog_selected = 1;
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('3') => {
+                            self.export_dialog_selected = 2;
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
+                // Handle annotation mode input
                 if self.annotation_mode {
                     if let Some(ref mut ann) = self.annotation {
                         // Forward keyboard input to Text tool when typing
@@ -764,56 +814,6 @@ impl App {
                     match key_event.key {
                         Key::Escape | Key::Return | Key::Char('i') if key_event.modifiers.ctrl => {
                             self.properties_panel_active = false;
-                            self.needs_redraw = true;
-                        }
-                        _ => {}
-                    }
-                    return Ok(true);
-                }
-
-                // Export format dialog input
-                if self.export_dialog_active {
-                    match key_event.key {
-                        Key::Escape => {
-                            self.export_dialog_active = false;
-                            self.needs_redraw = true;
-                        }
-                        Key::Return => {
-                            let format = match self.export_dialog_selected {
-                                0 => "png",
-                                1 => "jpeg",
-                                2 => "pdf",
-                                _ => "png",
-                            };
-                            self.export_dialog_active = false;
-                            match self.export_current_page(format) {
-                                Ok(()) => {}
-                                Err(e) => tracing::error!("Export failed: {}", e),
-                            }
-                            self.needs_redraw = true;
-                        }
-                        Key::Up | Key::Char('k') => {
-                            if self.export_dialog_selected > 0 {
-                                self.export_dialog_selected -= 1;
-                            }
-                            self.needs_redraw = true;
-                        }
-                        Key::Down | Key::Char('j') => {
-                            if self.export_dialog_selected < 2 {
-                                self.export_dialog_selected += 1;
-                            }
-                            self.needs_redraw = true;
-                        }
-                        Key::Char('1') => {
-                            self.export_dialog_selected = 0;
-                            self.needs_redraw = true;
-                        }
-                        Key::Char('2') => {
-                            self.export_dialog_selected = 1;
-                            self.needs_redraw = true;
-                        }
-                        Key::Char('3') => {
-                            self.export_dialog_selected = 2;
                             self.needs_redraw = true;
                         }
                         _ => {}
