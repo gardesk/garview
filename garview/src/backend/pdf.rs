@@ -1,4 +1,5 @@
 use super::{Backend, LinkDestination, PageSize, RenderedPage};
+use crate::forms::{FormFieldInfo, FormFieldType, FormFieldValue};
 use anyhow::{anyhow, Result};
 use cairo::glib::translate::ToGlibPtr;
 use poppler::{ffi, Document, IndexIter, Rectangle, SelectionStyle};
@@ -396,5 +397,219 @@ impl Backend for PdfBackend {
         }
 
         links
+    }
+
+    fn supports_forms(&self) -> bool {
+        self.document.is_some()
+    }
+
+    fn get_form_fields(&self, page: usize) -> Vec<FormFieldInfo> {
+        let p = match self.get_page(page) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+
+        let mappings = p.form_field_mapping();
+        let mut fields = Vec::new();
+
+        for mapping in mappings {
+            unsafe {
+                let mapping_ptr: *mut ffi::PopplerFormFieldMapping = mapping.to_glib_none().0;
+                if mapping_ptr.is_null() {
+                    continue;
+                }
+
+                let mapping_ffi = &*mapping_ptr;
+                let field_ptr = mapping_ffi.field;
+                if field_ptr.is_null() {
+                    continue;
+                }
+
+                // Get the area rectangle
+                let area = (
+                    mapping_ffi.area.x1,
+                    mapping_ffi.area.y1,
+                    mapping_ffi.area.x2,
+                    mapping_ffi.area.y2,
+                );
+
+                // Get field ID
+                let field_id = ffi::poppler_form_field_get_id(field_ptr);
+
+                // Get field name
+                let name_ptr = ffi::poppler_form_field_get_name(field_ptr);
+                let name = if !name_ptr.is_null() {
+                    Some(CStr::from_ptr(name_ptr).to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+
+                // Check if read-only
+                let read_only = ffi::poppler_form_field_is_read_only(field_ptr) != 0;
+
+                // Get font size
+                let font_size = ffi::poppler_form_field_get_font_size(field_ptr);
+
+                // Get field type
+                let field_type_raw = ffi::poppler_form_field_get_field_type(field_ptr);
+
+                let field_type = match field_type_raw {
+                    ffi::POPPLER_FORM_FIELD_TEXT => {
+                        // Get text field properties
+                        let text_ptr = ffi::poppler_form_field_text_get_text(field_ptr);
+                        let value = if !text_ptr.is_null() {
+                            let s = CStr::from_ptr(text_ptr).to_string_lossy().into_owned();
+                            cairo::glib::ffi::g_free(text_ptr as *mut _);
+                            s
+                        } else {
+                            String::new()
+                        };
+
+                        let max_len_raw = ffi::poppler_form_field_text_get_max_len(field_ptr);
+                        let max_len = if max_len_raw > 0 {
+                            Some(max_len_raw)
+                        } else {
+                            None
+                        };
+
+                        let text_type = ffi::poppler_form_field_text_get_text_type(field_ptr);
+                        let multiline = text_type == ffi::POPPLER_FORM_TEXT_MULTILINE;
+                        let password = ffi::poppler_form_field_text_is_password(field_ptr) != 0;
+
+                        FormFieldType::Text {
+                            value,
+                            max_len,
+                            multiline,
+                            password,
+                        }
+                    }
+                    ffi::POPPLER_FORM_FIELD_BUTTON => {
+                        let button_type = ffi::poppler_form_field_button_get_button_type(field_ptr);
+                        let state = ffi::poppler_form_field_button_get_state(field_ptr) != 0;
+
+                        match button_type {
+                            ffi::POPPLER_FORM_BUTTON_CHECK => FormFieldType::Checkbox { checked: state },
+                            ffi::POPPLER_FORM_BUTTON_RADIO => {
+                                // Get radio group name (use field name or ID as group)
+                                let group = name.clone().unwrap_or_else(|| field_id.to_string());
+                                FormFieldType::RadioButton {
+                                    group,
+                                    selected: state,
+                                }
+                            }
+                            _ => FormFieldType::Unknown,
+                        }
+                    }
+                    ffi::POPPLER_FORM_FIELD_CHOICE => {
+                        let choice_type = ffi::poppler_form_field_choice_get_choice_type(field_ptr);
+                        let n_items = ffi::poppler_form_field_choice_get_n_items(field_ptr);
+                        let editable = ffi::poppler_form_field_choice_is_editable(field_ptr) != 0;
+
+                        let mut items = Vec::with_capacity(n_items as usize);
+                        let mut selected = None;
+
+                        for i in 0..n_items {
+                            let item_ptr = ffi::poppler_form_field_choice_get_item(field_ptr, i);
+                            if !item_ptr.is_null() {
+                                let item = CStr::from_ptr(item_ptr).to_string_lossy().into_owned();
+                                cairo::glib::ffi::g_free(item_ptr as *mut _);
+                                items.push(item);
+
+                                if ffi::poppler_form_field_choice_is_item_selected(field_ptr, i) != 0 {
+                                    selected = Some(i);
+                                }
+                            }
+                        }
+
+                        FormFieldType::Dropdown {
+                            items,
+                            selected,
+                            editable,
+                        }
+                    }
+                    ffi::POPPLER_FORM_FIELD_SIGNATURE => FormFieldType::Signature,
+                    _ => FormFieldType::Unknown,
+                };
+
+                fields.push(FormFieldInfo {
+                    id: field_id,
+                    page,
+                    rect: area,
+                    field_type,
+                    name,
+                    read_only,
+                    font_size,
+                });
+            }
+        }
+
+        fields
+    }
+
+    fn set_form_field_value(&mut self, field_id: i32, value: FormFieldValue) -> Result<()> {
+        let doc = self
+            .document
+            .as_ref()
+            .ok_or_else(|| anyhow!("No document loaded"))?;
+
+        // Get the form field by ID
+        let field = doc
+            .form_field(field_id)
+            .ok_or_else(|| anyhow!("Form field not found: {}", field_id))?;
+
+        match value {
+            FormFieldValue::Text(text) => {
+                field.text_set_text(&text);
+            }
+            FormFieldValue::Boolean(state) => {
+                field.button_set_state(state);
+            }
+            FormFieldValue::ChoiceIndex(index) => {
+                // Unselect all first, then select the chosen item
+                field.choice_unselect_all();
+                field.choice_select_item(index);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn save_document(&self, path: &Path) -> Result<()> {
+        let _doc = self
+            .document
+            .as_ref()
+            .ok_or_else(|| anyhow!("No document loaded"))?;
+
+        let abs_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf());
+        let uri = format!("file://{}", abs_path.display());
+
+        // poppler-rs Document::save() method
+        // Note: This requires the document to be opened with write permissions
+        unsafe {
+            let doc_ptr: *mut ffi::PopplerDocument = _doc.to_glib_none().0;
+            let uri_cstring = std::ffi::CString::new(uri.as_bytes())
+                .map_err(|_| anyhow!("Invalid URI"))?;
+            let mut error: *mut cairo::glib::ffi::GError = std::ptr::null_mut();
+
+            // Use poppler_document_save
+            let result = ffi::poppler_document_save(
+                doc_ptr,
+                uri_cstring.as_ptr() as *const u8,
+                &mut error,
+            );
+
+            if result == 0 {
+                if !error.is_null() {
+                    let msg = CStr::from_ptr((*error).message).to_string_lossy().into_owned();
+                    cairo::glib::ffi::g_error_free(error);
+                    return Err(anyhow!("Failed to save PDF: {}", msg));
+                }
+                return Err(anyhow!("Failed to save PDF"));
+            }
+        }
+
+        Ok(())
     }
 }
