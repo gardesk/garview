@@ -573,6 +573,13 @@ impl ImageViewer {
         self.flip_v
     }
 
+    /// Invalidate page cache (forces re-render on next draw)
+    pub fn invalidate_page_cache(&mut self) {
+        self.surface = None;
+        self.surface_scale = 0.0;
+        self.page_surfaces.clear();
+    }
+
     // Info
     pub fn file_info(&self) -> Option<FileInfo> {
         let path = self.current_path.as_ref()?;
