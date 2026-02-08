@@ -1011,8 +1011,8 @@ impl App {
                         }
                         return Ok(true);
                     }
-                    // Export dialog (Ctrl+Shift+E)
-                    Key::Char('E') if key_event.modifiers.ctrl && !self.annotation_mode => {
+                    // Export dialog (Ctrl+Shift+E) - works in annotation mode too
+                    Key::Char('E') if key_event.modifiers.ctrl => {
                         self.export_dialog_active = true;
                         self.export_dialog_selected = 0;
                         self.needs_redraw = true;
@@ -2379,9 +2379,7 @@ impl App {
             let _ = ann.save_annotations(&path);
         }
 
-        // Exit annotation mode after exporting
-        self.annotation_mode = false;
-        self.annotation = None;
+        // Stay in annotation mode - user can exit manually with Escape
 
         Ok(())
     }
