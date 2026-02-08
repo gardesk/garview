@@ -387,7 +387,15 @@ impl App {
                     if let Some(ref mut ann) = self.annotation {
                         match key_event.key {
                             Key::Escape => {
-                                // Exit annotation mode (discard changes)
+                                // Exit annotation mode - save if modified
+                                if ann.modified {
+                                    if let Some(path) = self.viewer.current_path() {
+                                        let path = path.to_path_buf();
+                                        if let Err(e) = ann.save_annotations(&path) {
+                                            tracing::error!("Failed to save annotations: {}", e);
+                                        }
+                                    }
+                                }
                                 self.annotation_mode = false;
                                 self.annotation = None;
                                 self.needs_redraw = true;
@@ -428,10 +436,16 @@ impl App {
                             Key::Char('y') if key_event.modifiers.ctrl => {
                                 let _ = ann.redo();
                             }
-                            // Save annotated image (Ctrl+S)
+                            // Save annotations to sidecar (Ctrl+S)
                             Key::Char('s') if key_event.modifiers.ctrl => {
-                                if let Err(e) = self.save_annotated_image() {
-                                    tracing::error!("Failed to save annotated image: {}", e);
+                                if let Err(e) = self.save_annotations() {
+                                    tracing::error!("Failed to save annotations: {}", e);
+                                }
+                            }
+                            // Export flattened image (Ctrl+E)
+                            Key::Char('e') if key_event.modifiers.ctrl => {
+                                if let Err(e) = self.export_annotated_image() {
+                                    tracing::error!("Failed to export annotated image: {}", e);
                                 }
                             }
                             // Clear all annotations
@@ -1891,18 +1905,40 @@ impl App {
     /// Toggle annotation mode
     fn toggle_annotation_mode(&mut self) -> Result<()> {
         if self.annotation_mode {
-            // Exit annotation mode
+            // Exit annotation mode - save if modified
+            if let Some(ref mut ann) = self.annotation {
+                if ann.modified {
+                    if let Some(path) = self.viewer.current_path() {
+                        let path = path.to_path_buf();
+                        if let Err(e) = ann.save_annotations(&path) {
+                            tracing::error!("Failed to save annotations: {}", e);
+                        }
+                    }
+                }
+            }
             self.annotation_mode = false;
             self.annotation = None;
             tracing::info!("Exited annotation mode");
         } else {
             // Enter annotation mode - create annotation manager from current image
             if let Some(rendered) = self.viewer.current_rendered_page() {
-                let ann = AnnotationManager::new(&rendered.data, rendered.width, rendered.height)?;
+                let mut ann = AnnotationManager::new(&rendered.data, rendered.width, rendered.height)?;
+
+                // Load existing annotations if they exist
+                if let Some(path) = self.viewer.current_path() {
+                    if let Ok(Some(data)) = AnnotationManager::load_annotations(path) {
+                        if let Err(e) = ann.restore_from_data(&data) {
+                            tracing::error!("Failed to restore annotations: {}", e);
+                        } else {
+                            tracing::info!("Loaded existing annotations");
+                        }
+                    }
+                }
+
                 self.annotation = Some(ann);
                 self.annotation_mode = true;
-                tracing::info!("Entered annotation mode - use tools: b=brush, l=line, a=arrow, r=rect, e=ellipse, h=highlight");
-                tracing::info!("Colors: 1-9, Size: +/-, Fill: f, Undo: Ctrl+Z, Save: Ctrl+S, Exit: Esc");
+                tracing::info!("Entered annotation mode - tools: b=brush, l=line, a=arrow, r=rect, e=ellipse, h=highlight");
+                tracing::info!("Colors: 1-9, Size: +/-, Fill: f, Undo: Ctrl+Z, Save: Ctrl+S, Export: Ctrl+E, Exit: Esc/Ctrl+A");
             } else {
                 tracing::warn!("Cannot enter annotation mode: no image loaded");
             }
@@ -1911,11 +1947,20 @@ impl App {
         Ok(())
     }
 
-    /// Save the annotated image
-    fn save_annotated_image(&mut self) -> Result<()> {
+    /// Save annotations to sidecar file
+    fn save_annotations(&mut self) -> Result<()> {
+        let ann = self.annotation.as_mut().context("No annotation in progress")?;
+        let path = self.viewer.current_path().context("No file loaded")?.to_path_buf();
+        ann.save_annotations(&path)?;
+        tracing::info!("Annotations saved");
+        Ok(())
+    }
+
+    /// Export the annotated image as a flattened PNG
+    fn export_annotated_image(&mut self) -> Result<()> {
         let ann = self.annotation.as_mut().context("No annotation in progress")?;
 
-        // Export annotated image
+        // Export annotated image (flattened with background)
         let data = ann.export()?;
         let width = ann.canvas.width();
         let height = ann.canvas.height();
@@ -1931,9 +1976,15 @@ impl App {
             .context("Failed to create image from annotation data")?;
         img.save(&output_path).context("Failed to save annotated image")?;
 
-        tracing::info!("Saved annotated image to: {}", output_path.display());
+        tracing::info!("Exported annotated image to: {}", output_path.display());
 
-        // Exit annotation mode after saving
+        // Also save annotations to sidecar for future editing
+        if let Some(path) = self.viewer.current_path() {
+            let path = path.to_path_buf();
+            let _ = ann.save_annotations(&path);
+        }
+
+        // Exit annotation mode after exporting
         self.annotation_mode = false;
         self.annotation = None;
 
