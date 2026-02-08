@@ -8,6 +8,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt, EventMask};
 
 use crate::annotate::{AnnotationManager, ToolType};
 use crate::config::Config;
+use crate::forms::FormState;
 use crate::ipc::{create_viewer_info, IpcCommand, IpcServer};
 use crate::recent::RecentFiles;
 use crate::ui::{Sidebar, StatusBar, ThumbnailData, STATUS_BAR_HEIGHT, SIDEBAR_WIDTH};
@@ -79,6 +80,10 @@ pub struct App {
     annotation_mode: bool,
     /// IPC server for garviewctl
     ipc_server: Option<IpcServer>,
+    /// PDF form state
+    form_state: Option<FormState>,
+    /// Last form field click (time, field_id) for double-click detection
+    last_form_click: Option<(std::time::Instant, i32)>,
 }
 
 impl App {
@@ -202,6 +207,8 @@ impl App {
             annotation: None,
             annotation_mode: false,
             ipc_server: IpcServer::start().ok(),
+            form_state: None,
+            last_form_click: None,
         })
     }
 
@@ -219,6 +226,9 @@ impl App {
         if let Err(e) = event_loop.enable_xdnd() {
             tracing::warn!("Failed to enable drag and drop: {}", e);
         }
+
+        // Load form fields for initial document (if any)
+        self.load_form_fields();
 
         event_loop.run(|event_loop, event| {
             // Handle event (errors are logged, not propagated)
@@ -346,6 +356,7 @@ impl App {
                             let _ = self.recent_files.save();
                             self.mode = ViewMode::Image;
                             self.restore_session(&path);
+                            self.load_form_fields();
                         }
                         break; // Only open the first file
                     } else if path.is_dir() {
@@ -434,6 +445,95 @@ impl App {
                     return Ok(true);
                 }
 
+                // Handle form field input when focused
+                if let Some(ref mut form_state) = self.form_state {
+                    if form_state.focused_field.is_some() {
+                        match key_event.key {
+                            Key::Escape => {
+                                // Unfocus without committing (discard changes)
+                                form_state.unfocus(false);
+                                self.needs_redraw = true;
+                            }
+                            Key::Return => {
+                                // Commit text field changes
+                                if let Some((field_id, value)) = form_state.unfocus(true) {
+                                    // Write value to backend
+                                    if let Some(backend) = self.viewer.backend_mut() {
+                                        if let Err(e) = backend.set_form_field_value(field_id, value) {
+                                            tracing::error!("Failed to set form field value: {}", e);
+                                        }
+                                    }
+                                }
+                                self.needs_redraw = true;
+                            }
+                            Key::Tab => {
+                                // Commit current field and move to next
+                                if let Some((field_id, value)) = form_state.commit_current() {
+                                    if let Some(backend) = self.viewer.backend_mut() {
+                                        let _ = backend.set_form_field_value(field_id, value);
+                                    }
+                                }
+                                if key_event.modifiers.shift {
+                                    form_state.focus_prev();
+                                } else {
+                                    form_state.focus_next();
+                                }
+                                self.needs_redraw = true;
+                            }
+                            Key::Backspace => {
+                                form_state.backspace();
+                                self.needs_redraw = true;
+                            }
+                            Key::Delete => {
+                                form_state.delete();
+                                self.needs_redraw = true;
+                            }
+                            Key::Left => {
+                                form_state.cursor_left();
+                                self.needs_redraw = true;
+                            }
+                            Key::Right => {
+                                form_state.cursor_right();
+                                self.needs_redraw = true;
+                            }
+                            Key::Home => {
+                                form_state.cursor_home();
+                                self.needs_redraw = true;
+                            }
+                            Key::End => {
+                                form_state.cursor_end();
+                                self.needs_redraw = true;
+                            }
+                            Key::Space => {
+                                // Space toggles checkbox/radio, or inserts space in text
+                                if let Some(field) = form_state.focused() {
+                                    match &field.field_type {
+                                        crate::forms::FormFieldType::Checkbox { .. }
+                                        | crate::forms::FormFieldType::RadioButton { .. } => {
+                                            if let Some((field_id, value)) = form_state.toggle_checkbox() {
+                                                if let Some(backend) = self.viewer.backend_mut() {
+                                                    let _ = backend.set_form_field_value(field_id, value);
+                                                }
+                                            }
+                                        }
+                                        crate::forms::FormFieldType::Text { .. } => {
+                                            form_state.insert_char(' ');
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                self.needs_redraw = true;
+                            }
+                            Key::Char(c) => {
+                                form_state.insert_char(c);
+                                self.needs_redraw = true;
+                            }
+                            _ => {}
+                        }
+                        return Ok(true);
+                    }
+                }
+
                 // Handle search input mode first
                 if self.search_active {
                     match key_event.key {
@@ -502,6 +602,7 @@ impl App {
                                             let _ = self.recent_files.save();
                                             self.mode = ViewMode::Image;
                                             self.restore_session(&path);
+                                            self.load_form_fields();
                                         }
                                     }
                                     Ok(None) => {
@@ -526,6 +627,7 @@ impl App {
                                         let _ = self.recent_files.save();
                                         self.mode = ViewMode::Image;
                                         self.restore_session(&path);
+                                        self.load_form_fields();
                                     }
                                 }
                                 self.recent_panel_active = false;
@@ -639,6 +741,31 @@ impl App {
                             tracing::error!("Failed to copy image to clipboard: {}", e);
                         } else {
                             tracing::info!("Copied image to clipboard");
+                        }
+                        return Ok(true);
+                    }
+                    // Save document with form changes (Ctrl+S)
+                    Key::Char('s') if key_event.modifiers.ctrl => {
+                        let should_save = self.form_state.as_ref().is_some_and(|fs| fs.modified);
+                        if should_save {
+                            // Clone path to avoid borrow conflict
+                            let path = self.viewer.current_path().map(|p| p.to_path_buf());
+                            if let Some(path) = path {
+                                if let Some(backend) = self.viewer.backend_mut() {
+                                    match backend.save_document(&path) {
+                                        Ok(()) => {
+                                            tracing::info!("Saved document: {}", path.display());
+                                            // Clear modified flag
+                                            if let Some(ref mut fs) = self.form_state {
+                                                fs.modified = false;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to save document: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         return Ok(true);
                     }
@@ -784,6 +911,90 @@ impl App {
                             if let Some(dest) = self.viewer.link_at_position(pdf_x, pdf_y) {
                                 self.handle_link_click(dest);
                                 return Ok(true);
+                            }
+                        }
+                    }
+
+                    // Check for form field click
+                    if self.form_state.is_some() {
+                        let pdf_coords = self.screen_to_pdf_coords(
+                            mouse_event.position.x as f64,
+                            mouse_event.position.y as f64,
+                        );
+                        let current_page = self.viewer.current_page();
+
+                        if let Some((pdf_x, pdf_y)) = pdf_coords {
+                            // First, check if we clicked on a form field
+                            let clicked_field = if let Some(ref form_state) = self.form_state {
+                                form_state.field_at_position(current_page, pdf_x, pdf_y)
+                                    .map(|f| (f.id, f.field_type.clone()))
+                            } else {
+                                None
+                            };
+
+                            if let Some((field_id, field_type)) = clicked_field {
+                                let now = std::time::Instant::now();
+
+                                // Commit current field before switching (if different field)
+                                if let Some(ref mut form_state) = self.form_state {
+                                    if form_state.focused_field != Some(field_id) {
+                                        if let Some((fid, value)) = form_state.commit_current() {
+                                            if let Some(backend) = self.viewer.backend_mut() {
+                                                let _ = backend.set_form_field_value(fid, value);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check for double-click on checkbox/radio
+                                let is_double_click = self.last_form_click
+                                    .map(|(time, last_id)| {
+                                        last_id == field_id && now.duration_since(time).as_millis() < 400
+                                    })
+                                    .unwrap_or(false);
+
+                                if is_double_click {
+                                    // Double-click: toggle checkbox/radio immediately
+                                    match field_type {
+                                        crate::forms::FormFieldType::Checkbox { .. }
+                                        | crate::forms::FormFieldType::RadioButton { .. } => {
+                                            if let Some(ref mut form_state) = self.form_state {
+                                                form_state.focus_field(field_id);
+                                                if let Some((fid, value)) = form_state.toggle_checkbox() {
+                                                    if let Some(backend) = self.viewer.backend_mut() {
+                                                        let _ = backend.set_form_field_value(fid, value);
+                                                    }
+                                                }
+                                            }
+                                            self.last_form_click = None;
+                                            self.needs_redraw = true;
+                                            return Ok(true);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // Single click: focus the field
+                                if let Some(ref mut form_state) = self.form_state {
+                                    if form_state.focus_field(field_id) {
+                                        self.last_form_click = Some((now, field_id));
+                                        self.needs_redraw = true;
+                                        return Ok(true);
+                                    }
+                                }
+                            } else {
+                                // Clicked outside any form field - commit and unfocus current field
+                                if let Some(ref mut form_state) = self.form_state {
+                                    if form_state.focused_field.is_some() {
+                                        if let Some((fid, value)) = form_state.unfocus(true) {
+                                            if let Some(backend) = self.viewer.backend_mut() {
+                                                let _ = backend.set_form_field_value(fid, value);
+                                            }
+                                        }
+                                        self.last_form_click = None;
+                                        self.needs_redraw = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1219,6 +1430,7 @@ impl App {
                         self.mode = ViewMode::Image;
                         // Restore session for the newly loaded file
                         self.restore_session(&path);
+                        self.load_form_fields();
                     }
                 }
                 self.needs_redraw = true;
@@ -1541,6 +1753,7 @@ impl App {
                         let _ = self.recent_files.save();
                         self.mode = ViewMode::Image;
                         self.restore_session(&path);
+                        self.load_form_fields();
                         Response::ok_with_message(format!("Opened: {}", path.display()))
                     }
                     Err(e) => Response::error(format!("Failed to open: {}", e)),
@@ -1765,7 +1978,9 @@ impl App {
                 // For multi-page documents, show page position; otherwise show directory position
                 let pos = self.viewer.page_position()
                     .or_else(|| self.viewer.directory_position());
-                self.statusbar.render(
+                // Check if form has unsaved changes
+                let modified = self.form_state.as_ref().is_some_and(|fs| fs.modified);
+                self.statusbar.render_full(
                     &self.renderer,
                     size.width,
                     viewport_height,
@@ -1773,6 +1988,8 @@ impl App {
                     self.viewer.zoom.level,
                     self.viewer.zoom.mode,
                     pos,
+                    None,
+                    modified,
                 )?;
             }
             ViewMode::Gallery => {
@@ -1987,6 +2204,21 @@ impl App {
                             rotation,
                             flip_h,
                             flip_v,
+                            size.width as f64,
+                            viewport_height as f64,
+                        )?;
+                    }
+                }
+
+                // Render form fields if present
+                if self.form_state.is_some() {
+                    if let Some(page_size) = self.viewer.page_size_for(current_page) {
+                        self.render_form_fields(
+                            current_page,
+                            x,
+                            y,
+                            zoom,
+                            page_size.height,
                             size.width as f64,
                             viewport_height as f64,
                         )?;
@@ -2319,6 +2551,205 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    /// Render form field boundaries and content overlays
+    #[allow(clippy::too_many_arguments)]
+    fn render_form_fields(
+        &self,
+        page: usize,
+        x: f64,
+        y: f64,
+        zoom: f64,
+        page_height: f64,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Result<()> {
+        let form_state = match &self.form_state {
+            Some(fs) => fs,
+            None => return Ok(()),
+        };
+
+        let ctx = self.renderer.context()?;
+
+        ctx.save()?;
+
+        // Clip to viewport
+        ctx.rectangle(0.0, 0.0, viewport_width, viewport_height);
+        ctx.clip();
+
+        // Translate to page position
+        ctx.translate(x, y);
+
+        // Render each form field on this page
+        for field in form_state.fields.iter().filter(|f| f.page == page) {
+            let (pdf_x1, pdf_y1, pdf_x2, pdf_y2) = field.rect;
+
+            // Convert PDF coordinates (Y=0 at bottom) to screen coordinates
+            let screen_y1 = page_height - pdf_y2;
+            let screen_y2 = page_height - pdf_y1;
+
+            // Apply zoom
+            let rect_x = pdf_x1 * zoom;
+            let rect_y = screen_y1 * zoom;
+            let rect_w = (pdf_x2 - pdf_x1) * zoom;
+            let rect_h = (screen_y2 - screen_y1) * zoom;
+
+            let is_focused = form_state.focused_field == Some(field.id);
+
+            // Draw field boundary
+            if is_focused {
+                // Focused field: blue with thicker border
+                ctx.set_source_rgba(0.2, 0.4, 0.8, 0.3);
+                ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+                ctx.fill()?;
+
+                ctx.set_source_rgba(0.2, 0.4, 0.8, 0.9);
+                ctx.set_line_width(2.0);
+            } else {
+                // Non-focused field: subtle border
+                ctx.set_source_rgba(0.3, 0.3, 0.3, 0.3);
+                ctx.set_line_width(1.0);
+            }
+            ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+            ctx.stroke()?;
+
+            // Draw field content based on type
+            match &field.field_type {
+                crate::forms::FormFieldType::Text { value, max_len, .. } => {
+                    // Render text content (or text buffer if focused)
+                    let text = if is_focused {
+                        &form_state.text_buffer
+                    } else {
+                        value
+                    };
+
+                    if !text.is_empty() {
+                        ctx.set_source_rgb(0.0, 0.0, 0.0);
+
+                        // Calculate font size based on field height
+                        let font_size = if field.font_size > 0.0 {
+                            field.font_size * zoom
+                        } else {
+                            (rect_h * 0.7).min(14.0 * zoom)
+                        };
+
+                        ctx.select_font_face(
+                            "Sans",
+                            gartk_render::cairo::FontSlant::Normal,
+                            gartk_render::cairo::FontWeight::Normal,
+                        );
+                        ctx.set_font_size(font_size);
+
+                        // Center text vertically using font metrics
+                        let extents = ctx.font_extents()?;
+                        let text_y = rect_y + (rect_h + extents.height()) / 2.0 - extents.descent();
+
+                        // Check if we should use character spacing (for fields with max_len like SSN boxes)
+                        if let Some(max) = max_len {
+                            if *max > 0 && *max <= 10 {
+                                // Fixed character spacing - divide field width by max chars
+                                let char_width = rect_w / (*max as f64);
+                                for (i, ch) in text.chars().enumerate() {
+                                    if i >= *max as usize {
+                                        break;
+                                    }
+                                    // Center each character in its box
+                                    let ch_str = ch.to_string();
+                                    let ch_extents = ctx.text_extents(&ch_str)?;
+                                    let char_x = rect_x + (i as f64 * char_width) + (char_width - ch_extents.width()) / 2.0;
+                                    ctx.move_to(char_x, text_y);
+                                    ctx.show_text(&ch_str)?;
+                                }
+                            } else {
+                                // Normal text rendering
+                                ctx.move_to(rect_x + 2.0 * zoom, text_y);
+                                ctx.show_text(text)?;
+                            }
+                        } else {
+                            // Normal text rendering
+                            ctx.move_to(rect_x + 2.0 * zoom, text_y);
+                            ctx.show_text(text)?;
+                        }
+                    }
+
+                    // Draw cursor if focused
+                    if is_focused {
+                        let cursor_pos = form_state.cursor_pos.min(form_state.text_buffer.len());
+                        let cursor_x = if let Some(max) = max_len {
+                            if *max > 0 && *max <= 10 {
+                                // Fixed spacing cursor
+                                let char_width = rect_w / (*max as f64);
+                                rect_x + (cursor_pos as f64 * char_width)
+                            } else {
+                                let cursor_text = &form_state.text_buffer[..cursor_pos];
+                                rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.width()
+                            }
+                        } else {
+                            let cursor_text = &form_state.text_buffer[..cursor_pos];
+                            rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.width()
+                        };
+                        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.8);
+                        ctx.set_line_width(1.0);
+                        ctx.move_to(cursor_x, rect_y + 2.0);
+                        ctx.line_to(cursor_x, rect_y + rect_h - 2.0);
+                        ctx.stroke()?;
+                    }
+                }
+                crate::forms::FormFieldType::Checkbox { checked } => {
+                    // Draw checkbox
+                    if *checked {
+                        ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
+                        // Draw checkmark
+                        let cx = rect_x + rect_w / 2.0;
+                        let cy = rect_y + rect_h / 2.0;
+                        let size = (rect_w.min(rect_h) * 0.4).min(10.0 * zoom);
+                        ctx.set_line_width(2.0);
+                        ctx.move_to(cx - size * 0.5, cy);
+                        ctx.line_to(cx - size * 0.1, cy + size * 0.4);
+                        ctx.line_to(cx + size * 0.5, cy - size * 0.4);
+                        ctx.stroke()?;
+                    }
+                }
+                crate::forms::FormFieldType::RadioButton { selected, .. } => {
+                    // Draw radio button
+                    if *selected {
+                        ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
+                        let cx = rect_x + rect_w / 2.0;
+                        let cy = rect_y + rect_h / 2.0;
+                        let radius = (rect_w.min(rect_h) * 0.3).min(6.0 * zoom);
+                        ctx.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+                        ctx.fill()?;
+                    }
+                }
+                crate::forms::FormFieldType::Dropdown { items, selected, .. } => {
+                    // Draw dropdown arrow indicator
+                    ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8);
+                    let arrow_x = rect_x + rect_w - 10.0 * zoom;
+                    let arrow_y = rect_y + rect_h / 2.0;
+                    let arrow_size = 4.0 * zoom;
+                    ctx.move_to(arrow_x - arrow_size, arrow_y - arrow_size / 2.0);
+                    ctx.line_to(arrow_x, arrow_y + arrow_size / 2.0);
+                    ctx.line_to(arrow_x + arrow_size, arrow_y - arrow_size / 2.0);
+                    ctx.stroke()?;
+
+                    // Draw selected item text
+                    if let Some(idx) = selected {
+                        if let Some(text) = items.get(*idx as usize) {
+                            ctx.set_source_rgb(0.0, 0.0, 0.0);
+                            let font_size = (rect_h * 0.7).min(14.0 * zoom);
+                            ctx.set_font_size(font_size);
+                            ctx.move_to(rect_x + 2.0 * zoom, rect_y + rect_h * 0.75);
+                            ctx.show_text(text)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        ctx.restore()?;
         Ok(())
     }
 
@@ -3059,6 +3490,33 @@ impl App {
             // Restore scroll position
             self.viewer.scroll.offset_x = scroll.0;
             self.viewer.scroll.offset_y = scroll.1;
+        }
+    }
+
+    /// Load form fields from the current document (if supported)
+    fn load_form_fields(&mut self) {
+        // Clear any existing form state
+        self.form_state = None;
+
+        // Check if backend supports forms
+        if let Some(backend) = self.viewer.backend_mut() {
+            if !backend.supports_forms() {
+                return;
+            }
+
+            // Load form fields from all pages
+            let mut state = FormState::new();
+            let page_count = backend.page_count();
+
+            for page in 0..page_count {
+                let fields = backend.get_form_fields(page);
+                state.fields.extend(fields);
+            }
+
+            if state.has_fields() {
+                tracing::info!("Loaded {} form fields", state.fields.len());
+                self.form_state = Some(state);
+            }
         }
     }
 
