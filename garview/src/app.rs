@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use cairo::PdfSurface;
 use gartk_core::{InputEvent, Key, MouseButton, Theme};
 use gartk_render::{copy_surface_to_window, Renderer};
 use gartk_x11::{Connection, EventLoop, EventLoopConfig, Window, WindowConfig};
@@ -864,6 +865,23 @@ impl App {
                     // Toggle annotation mode (Ctrl+A)
                     Key::Char('a') if key_event.modifiers.ctrl => {
                         self.toggle_annotation_mode()?;
+                        return Ok(true);
+                    }
+                    // Print (Ctrl+P)
+                    Key::Char('p') if key_event.modifiers.ctrl => {
+                        match self.print_current() {
+                            Ok(()) => tracing::info!("Print job sent"),
+                            Err(e) => tracing::error!("Print failed: {}", e),
+                        }
+                        return Ok(true);
+                    }
+                    // Export current page as PNG (Ctrl+E, outside annotation mode)
+                    Key::Char('e') if key_event.modifiers.ctrl && !self.annotation_mode => {
+                        let format = if key_event.modifiers.shift { "jpeg" } else { "png" };
+                        match self.export_current_page(format) {
+                            Ok(()) => {}
+                            Err(e) => tracing::error!("Export failed: {}", e),
+                        }
                         return Ok(true);
                     }
                     Key::Tab | Key::Char('g') => {
@@ -1987,6 +2005,112 @@ impl App {
         // Exit annotation mode after exporting
         self.annotation_mode = false;
         self.annotation = None;
+
+        Ok(())
+    }
+
+    /// Print the current document/image via CUPS (lpr)
+    fn print_current(&mut self) -> Result<()> {
+        let path = self.viewer.current_path().context("No file loaded")?;
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        // For PDFs, print directly
+        if ext == "pdf" {
+            let status = std::process::Command::new("lpr")
+                .arg(path)
+                .status()
+                .context("Failed to execute lpr - is CUPS installed?")?;
+
+            if status.success() {
+                tracing::info!("Sent {} to printer", path.display());
+            } else {
+                anyhow::bail!("lpr failed with exit code: {:?}", status.code());
+            }
+            return Ok(());
+        }
+
+        // For images, create a temporary PDF and print it
+        if let Some(rendered) = self.viewer.current_rendered_page() {
+            // Create a temporary PDF with the image
+            let temp_dir = std::env::temp_dir();
+            let temp_pdf = temp_dir.join("garview_print.pdf");
+
+            // Create PDF surface at image size
+            let pdf_surface = PdfSurface::new(
+                rendered.width as f64,
+                rendered.height as f64,
+                &temp_pdf,
+            ).context("Failed to create PDF surface")?;
+
+            let ctx = cairo::Context::new(&pdf_surface)?;
+
+            // Draw image to PDF
+            let img_surface = gartk_render::Surface::from_rgba(
+                &rendered.data,
+                rendered.width,
+                rendered.height,
+            )?;
+            ctx.set_source_surface(img_surface.cairo_surface(), 0.0, 0.0)?;
+            ctx.paint()?;
+
+            // Finish PDF
+            pdf_surface.finish();
+            drop(ctx);
+
+            // Print the PDF
+            let status = std::process::Command::new("lpr")
+                .arg(&temp_pdf)
+                .status()
+                .context("Failed to execute lpr - is CUPS installed?")?;
+
+            // Clean up temp file
+            let _ = std::fs::remove_file(&temp_pdf);
+
+            if status.success() {
+                tracing::info!("Sent image to printer");
+            } else {
+                anyhow::bail!("lpr failed with exit code: {:?}", status.code());
+            }
+        } else {
+            anyhow::bail!("No image to print");
+        }
+
+        Ok(())
+    }
+
+    /// Export current page/view as image (PNG or JPEG)
+    fn export_current_page(&mut self, format: &str) -> Result<()> {
+        let input_path = self.viewer.current_path().context("No file loaded")?;
+        let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
+        let parent = input_path.parent().unwrap_or(Path::new("."));
+
+        let (ext, output_path) = match format.to_lowercase().as_str() {
+            "jpeg" | "jpg" => ("jpg", parent.join(format!("{}_export.jpg", stem))),
+            _ => ("png", parent.join(format!("{}_export.png", stem))),
+        };
+
+        if let Some(rendered) = self.viewer.current_rendered_page() {
+            let img = image::RgbaImage::from_raw(
+                rendered.width,
+                rendered.height,
+                rendered.data,
+            ).context("Failed to create image from rendered data")?;
+
+            if ext == "jpg" {
+                // Convert to RGB for JPEG
+                let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+                rgb.save(&output_path)?;
+            } else {
+                img.save(&output_path)?;
+            }
+
+            tracing::info!("Exported to: {}", output_path.display());
+        } else {
+            anyhow::bail!("No page to export");
+        }
 
         Ok(())
     }

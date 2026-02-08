@@ -24,7 +24,7 @@ resvg = "0.44"
 
 # PDF
 poppler-rs = "0.24"
-cairo-rs = { version = "0.20", features = ["png"] }
+cairo-rs = { version = "0.20", features = ["png", "pdf"] }
 pango = "0.20"
 pangocairo = "0.20"
 
