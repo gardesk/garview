@@ -54,6 +54,12 @@ pub trait Tool {
 
     /// Get the bounding box of the current drawing.
     fn bounds(&self) -> Option<Rect>;
+
+    /// Get the start and end points for line-based tools (Arrow, Line).
+    /// Returns None for tools that don't use line geometry.
+    fn endpoints(&self) -> Option<((i32, i32), (i32, i32))> {
+        None
+    }
 }
 
 /// Create a boxed tool instance for the given tool type.

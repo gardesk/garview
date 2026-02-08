@@ -135,4 +135,12 @@ impl Tool for ArrowTool {
             None
         }
     }
+
+    fn endpoints(&self) -> Option<((i32, i32), (i32, i32))> {
+        if let (Some(start), Some(end)) = (self.start, self.end) {
+            Some(((start.x, start.y), (end.x, end.y)))
+        } else {
+            None
+        }
+    }
 }
