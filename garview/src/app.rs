@@ -929,9 +929,11 @@ impl App {
                 if self.mode == ViewMode::Image && mouse_event.button == Some(MouseButton::Left) {
                     // Check sidebar click first
                     if self.sidebar.visible {
+                        let annotations = self.annotation.as_ref().map(|a| a.annotations()).unwrap_or(&[]);
                         if let Some(page) = self.sidebar.handle_click(
                             mouse_event.position.x as f64,
                             mouse_event.position.y as f64,
+                            annotations,
                         ) {
                             self.viewer.goto_page(page);
                             self.needs_redraw = true;
@@ -1131,7 +1133,8 @@ impl App {
                 if self.sidebar.visible && (scroll_event.position.x as u32) < SIDEBAR_WIDTH {
                     let size = self.renderer.size();
                     let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
-                    self.sidebar.scroll(scroll_event.delta_y as f64 * 30.0, viewport_height);
+                    let ann_count = self.annotation.as_ref().map(|a| a.annotation_count()).unwrap_or(0);
+                    self.sidebar.scroll(scroll_event.delta_y as f64 * 30.0, viewport_height, ann_count);
                     self.needs_redraw = true;
                     return Ok(true);
                 }
@@ -2200,7 +2203,8 @@ impl App {
 
         // Render sidebar if visible
         if self.sidebar.visible {
-            self.sidebar.render(&self.renderer, viewport_height)?;
+            let annotations = self.annotation.as_ref().map(|a| a.annotations()).unwrap_or(&[]);
+            self.sidebar.render(&self.renderer, viewport_height, annotations)?;
         }
 
         // Render search bar if active

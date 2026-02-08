@@ -9,7 +9,7 @@ pub mod tools;
 
 pub use canvas::AnnotationCanvas;
 pub use history::History;
-pub use state::{AnnotationState, ToolProperties, ToolType};
+pub use state::{AnnotationRecord, AnnotationState, ToolType};
 pub use tools::{create_tool, Tool};
 
 use anyhow::{Context, Result};
@@ -28,6 +28,12 @@ pub struct AnnotationManager {
     pub history: History,
     /// Whether annotations have been modified since last save.
     pub modified: bool,
+    /// List of annotation records for sidebar display.
+    annotations: Vec<AnnotationRecord>,
+    /// Next annotation ID.
+    next_id: u64,
+    /// Current page (for multi-page documents).
+    current_page: usize,
 }
 
 impl AnnotationManager {
@@ -44,7 +50,30 @@ impl AnnotationManager {
             state,
             history,
             modified: false,
+            annotations: Vec::new(),
+            next_id: 1,
+            current_page: 0,
         })
+    }
+
+    /// Set the current page for new annotations.
+    pub fn set_page(&mut self, page: usize) {
+        self.current_page = page;
+    }
+
+    /// Get the list of annotation records.
+    pub fn annotations(&self) -> &[AnnotationRecord] {
+        &self.annotations
+    }
+
+    /// Get annotations for a specific page.
+    pub fn annotations_for_page(&self, page: usize) -> Vec<&AnnotationRecord> {
+        self.annotations.iter().filter(|a| a.page == page).collect()
+    }
+
+    /// Get number of annotations.
+    pub fn annotation_count(&self) -> usize {
+        self.annotations.len()
     }
 
     /// Get the sidecar annotation file path for a given file.
@@ -136,6 +165,19 @@ impl AnnotationManager {
 
     /// Commit the current tool drawing.
     pub fn commit_current(&mut self) -> Result<()> {
+        // Record annotation metadata before committing
+        if let Some(bounds) = self.tool.bounds() {
+            let record = AnnotationRecord::new(
+                self.next_id,
+                self.state.current_tool,
+                bounds,
+                self.state.properties.color,
+                self.current_page,
+            );
+            self.annotations.push(record);
+            self.next_id += 1;
+        }
+
         // Save snapshot for undo
         let snapshot = self.canvas.snapshot_annotations()?;
         self.history.push(snapshot);
@@ -172,6 +214,8 @@ impl AnnotationManager {
         let current = self.canvas.snapshot_annotations()?;
         if let Some(previous) = self.history.undo(current) {
             self.canvas.restore_annotations(&previous)?;
+            // Remove the last annotation record
+            self.annotations.pop();
             self.modified = true;
             Ok(true)
         } else {
@@ -218,6 +262,7 @@ impl AnnotationManager {
         self.history.push(snapshot);
 
         self.canvas.clear_annotations()?;
+        self.annotations.clear();
         self.tool.reset();
         self.modified = true;
 

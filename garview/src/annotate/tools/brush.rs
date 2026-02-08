@@ -3,7 +3,7 @@
 use super::Tool;
 use crate::annotate::state::ToolProperties;
 use cairo::Context;
-use gartk_core::{InputEvent, MouseButton, Point};
+use gartk_core::{InputEvent, MouseButton, Point, Rect};
 use gartk_x11::CursorShape;
 
 /// Brush drawing tool (freehand).
@@ -94,5 +94,18 @@ impl Tool for BrushTool {
 
     fn can_commit(&self) -> bool {
         self.points.len() >= 2
+    }
+
+    fn bounds(&self) -> Option<Rect> {
+        if self.points.is_empty() {
+            return None;
+        }
+        let min_x = self.points.iter().map(|p| p.x).min().unwrap_or(0);
+        let max_x = self.points.iter().map(|p| p.x).max().unwrap_or(0);
+        let min_y = self.points.iter().map(|p| p.y).min().unwrap_or(0);
+        let max_y = self.points.iter().map(|p| p.y).max().unwrap_or(0);
+        let w = (max_x - min_x) as u32;
+        let h = (max_y - min_y) as u32;
+        Some(Rect::new(min_x, min_y, w.max(1), h.max(1)))
     }
 }

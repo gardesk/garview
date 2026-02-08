@@ -18,7 +18,7 @@ pub use rectangle::RectangleTool;
 
 use crate::annotate::state::ToolProperties;
 use cairo::Context;
-use gartk_core::InputEvent;
+use gartk_core::{InputEvent, Rect};
 use gartk_x11::CursorShape;
 
 /// Tool behavior trait.
@@ -47,6 +47,9 @@ pub trait Tool {
 
     /// Check if the tool is ready to commit (has a valid drawing).
     fn can_commit(&self) -> bool;
+
+    /// Get the bounding box of the current drawing.
+    fn bounds(&self) -> Option<Rect>;
 }
 
 /// Create a boxed tool instance for the given tool type.

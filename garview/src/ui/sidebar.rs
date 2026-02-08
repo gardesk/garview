@@ -1,6 +1,7 @@
-//! Sidebar component with page thumbnails and table of contents.
+//! Sidebar component with page thumbnails, table of contents, and annotations.
 
 use anyhow::Result;
+use crate::annotate::AnnotationRecord;
 use gartk_render::Renderer;
 use std::collections::HashMap;
 
@@ -10,6 +11,7 @@ pub enum SidebarTab {
     #[default]
     Thumbnails,
     TableOfContents,
+    Annotations,
 }
 
 /// Table of contents entry
@@ -108,12 +110,13 @@ impl Sidebar {
     }
 
     /// Scroll the sidebar content
-    pub fn scroll(&mut self, delta_y: f64, viewport_height: u32) {
+    pub fn scroll(&mut self, delta_y: f64, viewport_height: u32, annotation_count: usize) {
         let content_height = match self.tab {
             SidebarTab::Thumbnails => {
                 (self.page_count as u32 * (THUMBNAIL_HEIGHT + THUMBNAIL_PADDING)) as f64
             }
             SidebarTab::TableOfContents => (self.toc.len() * 24) as f64,
+            SidebarTab::Annotations => (annotation_count * 32) as f64,
         };
 
         let available_height = viewport_height.saturating_sub(TAB_BAR_HEIGHT) as f64;
@@ -138,18 +141,21 @@ impl Sidebar {
     }
 
     /// Handle click at position, returns page number if a page was clicked
-    pub fn handle_click(&mut self, x: f64, y: f64) -> Option<usize> {
+    /// For annotation clicks, returns the annotation's page number
+    pub fn handle_click(&mut self, x: f64, y: f64, annotations: &[AnnotationRecord]) -> Option<usize> {
         if !self.visible || x > self.width as f64 {
             return None;
         }
 
         // Check tab bar clicks
         if y < TAB_BAR_HEIGHT as f64 {
-            let tab_width = self.width as f64 / 2.0;
+            let tab_width = self.width as f64 / 3.0;
             if x < tab_width {
                 self.switch_tab(SidebarTab::Thumbnails);
-            } else {
+            } else if x < tab_width * 2.0 {
                 self.switch_tab(SidebarTab::TableOfContents);
+            } else {
+                self.switch_tab(SidebarTab::Annotations);
             }
             return None;
         }
@@ -174,13 +180,21 @@ impl Sidebar {
                     return Some(entry.page);
                 }
             }
+            SidebarTab::Annotations => {
+                let item_height = 32.0;
+                let index = (content_y / item_height) as usize;
+                if let Some(ann) = annotations.get(index) {
+                    self.selected_page = Some(ann.page);
+                    return Some(ann.page);
+                }
+            }
         }
 
         None
     }
 
     /// Render the sidebar
-    pub fn render(&self, renderer: &Renderer, viewport_height: u32) -> Result<()> {
+    pub fn render(&self, renderer: &Renderer, viewport_height: u32, annotations: &[AnnotationRecord]) -> Result<()> {
         if !self.visible {
             return Ok(());
         }
@@ -210,6 +224,7 @@ impl Sidebar {
         match self.tab {
             SidebarTab::Thumbnails => self.render_thumbnails(&ctx, viewport_height)?,
             SidebarTab::TableOfContents => self.render_toc(&ctx, viewport_height)?,
+            SidebarTab::Annotations => self.render_annotations(&ctx, viewport_height, annotations)?,
         }
 
         ctx.restore()?;
@@ -225,10 +240,10 @@ impl Sidebar {
     }
 
     fn render_tab_bar(&self, ctx: &gartk_render::cairo::Context) -> Result<()> {
-        let tab_width = self.width as f64 / 2.0;
+        let tab_width = self.width as f64 / 3.0;
 
         // Tab backgrounds
-        for (i, tab) in [SidebarTab::Thumbnails, SidebarTab::TableOfContents]
+        for (i, tab) in [SidebarTab::Thumbnails, SidebarTab::TableOfContents, SidebarTab::Annotations]
             .iter()
             .enumerate()
         {
@@ -249,11 +264,12 @@ impl Sidebar {
                 gartk_render::cairo::FontSlant::Normal,
                 gartk_render::cairo::FontWeight::Normal,
             );
-            ctx.set_font_size(12.0);
+            ctx.set_font_size(11.0);
 
             let text = match tab {
                 SidebarTab::Thumbnails => "Pages",
-                SidebarTab::TableOfContents => "Contents",
+                SidebarTab::TableOfContents => "TOC",
+                SidebarTab::Annotations => "Notes",
             };
 
             if is_active {
@@ -270,11 +286,14 @@ impl Sidebar {
             ctx.show_text(text)?;
         }
 
-        // Tab separator
+        // Tab separators
         ctx.set_source_rgb(0.3, 0.3, 0.3);
         ctx.set_line_width(1.0);
         ctx.move_to(tab_width, 0.0);
         ctx.line_to(tab_width, TAB_BAR_HEIGHT as f64);
+        ctx.stroke()?;
+        ctx.move_to(tab_width * 2.0, 0.0);
+        ctx.line_to(tab_width * 2.0, TAB_BAR_HEIGHT as f64);
         ctx.stroke()?;
 
         // Bottom border
@@ -446,6 +465,83 @@ impl Sidebar {
                 entry.title.clone()
             };
             ctx.show_text(&title)?;
+        }
+
+        Ok(())
+    }
+
+    fn render_annotations(
+        &self,
+        ctx: &gartk_render::cairo::Context,
+        viewport_height: u32,
+        annotations: &[AnnotationRecord],
+    ) -> Result<()> {
+        let available_height = viewport_height.saturating_sub(TAB_BAR_HEIGHT);
+        let item_height = 32.0;
+
+        // Calculate visible range
+        let first_visible = (self.scroll_y / item_height) as usize;
+        let last_visible = ((self.scroll_y + available_height as f64) / item_height) as usize + 1;
+
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(11.0);
+
+        if annotations.is_empty() {
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.move_to(10.0, 30.0);
+            ctx.show_text("No annotations")?;
+            ctx.set_font_size(10.0);
+            ctx.move_to(10.0, 48.0);
+            ctx.show_text("Use Ctrl+A to annotate")?;
+            return Ok(());
+        }
+
+        for (i, ann) in annotations.iter().enumerate() {
+            if i < first_visible || i > last_visible {
+                continue;
+            }
+
+            let y = i as f64 * item_height;
+
+            // Selection highlight
+            if self.selected_page == Some(ann.page) {
+                ctx.set_source_rgba(0.3, 0.5, 0.8, 0.3);
+                ctx.rectangle(0.0, y, self.width as f64, item_height);
+                ctx.fill()?;
+            }
+
+            // Color indicator (small circle)
+            ctx.set_source_rgba(
+                ann.color.r as f64,
+                ann.color.g as f64,
+                ann.color.b as f64,
+                ann.color.a as f64,
+            );
+            ctx.arc(12.0, y + item_height / 2.0, 4.0, 0.0, std::f64::consts::PI * 2.0);
+            ctx.fill()?;
+
+            // Tool name
+            ctx.set_source_rgb(0.8, 0.8, 0.8);
+            ctx.move_to(22.0, y + 14.0);
+            ctx.show_text(ann.tool.name())?;
+
+            // Page number
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.set_font_size(10.0);
+            ctx.move_to(22.0, y + 26.0);
+            ctx.show_text(&format!("Page {}", ann.page + 1))?;
+            ctx.set_font_size(11.0);
+
+            // Position info (on right side)
+            let pos_text = format!("({}, {})", ann.bounds.x, ann.bounds.y);
+            let extents = ctx.text_extents(&pos_text)?;
+            ctx.set_source_rgb(0.4, 0.4, 0.4);
+            ctx.move_to(self.width as f64 - extents.width() - 8.0, y + 20.0);
+            ctx.show_text(&pos_text)?;
         }
 
         Ok(())

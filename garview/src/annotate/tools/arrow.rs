@@ -3,7 +3,7 @@
 use super::Tool;
 use crate::annotate::state::ToolProperties;
 use cairo::Context;
-use gartk_core::{InputEvent, MouseButton, Point};
+use gartk_core::{InputEvent, MouseButton, Point, Rect};
 use gartk_x11::CursorShape;
 use std::f64::consts::PI;
 
@@ -121,6 +121,18 @@ impl Tool for ArrowTool {
             dx > 5 || dy > 5
         } else {
             false
+        }
+    }
+
+    fn bounds(&self) -> Option<Rect> {
+        if let (Some(start), Some(end)) = (self.start, self.end) {
+            let x = start.x.min(end.x);
+            let y = start.y.min(end.y);
+            let w = (start.x - end.x).abs() as u32;
+            let h = (start.y - end.y).abs() as u32;
+            Some(Rect::new(x, y, w.max(1), h.max(1)))
+        } else {
+            None
         }
     }
 }

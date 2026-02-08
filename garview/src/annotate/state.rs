@@ -1,6 +1,43 @@
 //! Annotation state machine and core types.
 
-use gartk_core::Color;
+use gartk_core::{Color, Rect};
+use std::time::SystemTime;
+
+/// Record of a committed annotation.
+#[derive(Debug, Clone)]
+pub struct AnnotationRecord {
+    /// Unique identifier.
+    pub id: u64,
+    /// Tool used.
+    pub tool: ToolType,
+    /// Bounding box in image coordinates.
+    pub bounds: Rect,
+    /// Color used.
+    pub color: Color,
+    /// Page number (for multi-page documents).
+    pub page: usize,
+    /// When this annotation was created.
+    pub timestamp: SystemTime,
+}
+
+impl AnnotationRecord {
+    /// Create a new annotation record.
+    pub fn new(id: u64, tool: ToolType, bounds: Rect, color: Color, page: usize) -> Self {
+        Self {
+            id,
+            tool,
+            bounds,
+            color,
+            page,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    /// Get a short description for display.
+    pub fn description(&self) -> String {
+        format!("{} on page {}", self.tool.name(), self.page + 1)
+    }
+}
 
 /// Tool type for annotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
