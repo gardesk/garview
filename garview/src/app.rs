@@ -2624,15 +2624,27 @@ impl App {
         match &field.field_type {
             crate::forms::FormFieldType::Text { max_len, .. } => {
                 let text = &form_state.text_buffer;
-
-                // Cover PDF's native text rendering with white fill
-                // Skip for character-spaced fields (SSN boxes etc.) to preserve grid lines
                 let uses_char_spacing = max_len.map(|m| m > 0 && m <= 10).unwrap_or(false);
-                if !uses_char_spacing {
-                    ctx.set_source_rgb(1.0, 1.0, 1.0);
-                    let inset = 1.0 * zoom;
-                    ctx.rectangle(rect_x + inset, rect_y + inset, rect_w - 2.0 * inset, rect_h - 2.0 * inset);
-                    ctx.fill()?;
+
+                // Always cover PDF's native text with white fill for focused field
+                ctx.set_source_rgb(1.0, 1.0, 1.0);
+                let inset = 1.0 * zoom;
+                ctx.rectangle(rect_x + inset, rect_y + inset, rect_w - 2.0 * inset, rect_h - 2.0 * inset);
+                ctx.fill()?;
+
+                // For character-spaced fields, redraw the grid lines we just covered
+                if uses_char_spacing {
+                    if let Some(max) = max_len {
+                        let char_width = rect_w / (*max as f64);
+                        ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8);
+                        ctx.set_line_width(1.0);
+                        for i in 1..*max {
+                            let line_x = rect_x + (i as f64 * char_width);
+                            ctx.move_to(line_x, rect_y + inset);
+                            ctx.line_to(line_x, rect_y + rect_h - inset);
+                        }
+                        ctx.stroke()?;
+                    }
                 }
 
                 // Calculate font size
