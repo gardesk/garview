@@ -103,7 +103,8 @@ impl AnnotationManager {
     }
 
     /// Load existing annotations from sidecar file.
-    pub fn load_annotations(file_path: &Path) -> Result<Option<Vec<u8>>> {
+    /// Returns (RGBA data, width, height) if annotations exist.
+    pub fn load_annotations(file_path: &Path) -> Result<Option<(Vec<u8>, u32, u32)>> {
         let ann_path = Self::annotation_path(file_path);
         if !ann_path.exists() {
             return Ok(None);
@@ -112,7 +113,9 @@ impl AnnotationManager {
         let img = image::open(&ann_path)
             .with_context(|| format!("Failed to load annotations from {:?}", ann_path))?;
         let rgba = img.to_rgba8();
-        Ok(Some(rgba.into_raw()))
+        let width = rgba.width();
+        let height = rgba.height();
+        Ok(Some((rgba.into_raw(), width, height)))
     }
 
     /// Load annotation records from JSON sidecar file.

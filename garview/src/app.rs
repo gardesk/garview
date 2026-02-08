@@ -2143,7 +2143,7 @@ impl App {
                         } else {
                             tracing::info!("Loaded existing annotations from overlay");
                         }
-                    } else if let Ok(Some(data)) = AnnotationManager::load_annotations(path) {
+                    } else if let Ok(Some((data, _, _))) = AnnotationManager::load_annotations(path) {
                         if let Err(e) = ann.restore_from_data(&data) {
                             tracing::error!("Failed to restore annotations: {}", e);
                         } else {
@@ -2715,8 +2715,17 @@ impl App {
                 if !self.annotation_mode {
                     if let Some((ref overlay_data, overlay_w, overlay_h)) = self.annotation_overlay {
                         if let Ok(overlay_surface) = gartk_render::Surface::from_rgba(overlay_data, overlay_w, overlay_h) {
+                            // Scale overlay to match image surface dimensions
+                            // The overlay was saved at specific dimensions, but image_surface
+                            // may be rendered at a different scale
+                            let overlay_scale_x = surface_w / overlay_w as f64;
+                            let overlay_scale_y = image_surface.height() as f64 / overlay_h as f64;
+
+                            ctx.save()?;
+                            ctx.scale(overlay_scale_x, overlay_scale_y);
                             ctx.set_source_surface(overlay_surface.cairo_surface(), 0.0, 0.0)?;
                             ctx.paint()?;
+                            ctx.restore()?;
                         }
                     }
                 }
@@ -4189,12 +4198,10 @@ impl App {
 
             // Load annotation PNG overlay
             match AnnotationManager::load_annotations(&path) {
-                Ok(Some(data)) => {
-                    // Get dimensions from current rendered page
-                    if let Some(rendered) = self.viewer.current_rendered_page() {
-                        self.annotation_overlay = Some((data, rendered.width, rendered.height));
-                        tracing::debug!("Loaded annotation overlay for {:?}", path);
-                    }
+                Ok(Some((data, width, height))) => {
+                    // Use dimensions from the PNG file itself
+                    self.annotation_overlay = Some((data, width, height));
+                    tracing::debug!("Loaded annotation overlay {}x{} for {:?}", width, height, path);
                 }
                 Ok(None) => {
                     // No annotations file exists
@@ -4254,12 +4261,22 @@ impl App {
 
         for tool in tools {
             let is_active = ann.state.current_tool == *tool;
-            let label = format!("[{}] {}", tool.shortcut().to_ascii_uppercase(), tool.name());
+            let shortcut = tool.shortcut().to_ascii_uppercase();
+            let name = tool.name();
+
+            // Format label: [A]rrow if shortcut matches first letter, else "Blur[X]"
+            let label = if name.chars().next().map(|c| c.to_ascii_uppercase()) == Some(shortcut) {
+                format!("[{}]{}", shortcut, &name[1..])
+            } else {
+                format!("{}[{}]", name, shortcut)
+            };
+
+            let label_width = ctx.text_extents(&label)?.width() + 12.0;
 
             // Background for active tool
             if is_active {
                 ctx.set_source_rgba(0.3, 0.5, 0.8, 0.8);
-                ctx.rectangle(x - 4.0, 6.0, 70.0, 28.0);
+                ctx.rectangle(x - 4.0, 6.0, label_width, 28.0);
                 ctx.fill()?;
             }
 
@@ -4268,7 +4285,7 @@ impl App {
             ctx.move_to(x, 25.0);
             ctx.show_text(&label)?;
 
-            x += 75.0;
+            x += label_width + 8.0;
         }
 
         // Separator
