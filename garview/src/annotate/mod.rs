@@ -10,7 +10,7 @@ pub mod tools;
 pub use canvas::AnnotationCanvas;
 pub use history::History;
 pub use state::{AnnotationRecord, AnnotationState, SerializableAnnotation, ToolType};
-pub use tools::{create_tool, Tool};
+pub use tools::{box_blur, create_tool, Tool};
 
 use anyhow::{Context, Result};
 use gartk_core::InputEvent;
@@ -207,8 +207,14 @@ impl AnnotationManager {
         }
 
         // Check if tool finished drawing (mouse released)
-        if !self.tool.is_drawing() && self.tool.can_commit() {
-            self.commit_current()?;
+        if !self.tool.is_drawing() {
+            if self.tool.can_commit() {
+                self.commit_current()?;
+            } else {
+                // Tool finished but can't commit (e.g., too small) - reset it
+                self.tool.reset();
+                self.canvas.clear_preview()?;
+            }
         }
 
         Ok(needs_redraw)
@@ -236,9 +242,43 @@ impl AnnotationManager {
         let snapshot = self.canvas.snapshot_annotations()?;
         self.history.push(snapshot);
 
-        // Commit preview to annotations
-        if let Ok(ctx) = self.canvas.annotations_surface().context() {
-            self.tool.commit(&ctx, &self.state.properties);
+        // Handle blur tool specially - needs to read and modify pixels
+        if self.state.current_tool == ToolType::Blur {
+            tracing::debug!("Blur tool commit - checking bounds");
+            if let Some(bounds) = self.tool.bounds() {
+                tracing::debug!("Blur bounds: {:?}", bounds);
+                // Clamp bounds to canvas with saturating subtraction to avoid overflow
+                let x = bounds.x.max(0);
+                let y = bounds.y.max(0);
+                let canvas_w = self.canvas.width();
+                let canvas_h = self.canvas.height();
+                let w = bounds.width.min(canvas_w.saturating_sub(x as u32));
+                let h = bounds.height.min(canvas_h.saturating_sub(y as u32));
+                tracing::debug!("Clamped blur region: x={}, y={}, w={}, h={} (canvas {}x{})", x, y, w, h, canvas_w, canvas_h);
+
+                if w > 0 && h > 0 {
+                    // Get region pixels (background + existing annotations)
+                    let mut pixels = self.canvas.get_region_for_blur(x, y, w, h)?;
+                    tracing::debug!("Got {} pixels for blur region", pixels.len());
+
+                    // Apply blur
+                    box_blur(&mut pixels, w, h, self.state.properties.blur_radius);
+                    tracing::debug!("Applied blur with radius {}", self.state.properties.blur_radius);
+
+                    // Paint blurred pixels back
+                    self.canvas.paint_blurred_region(&pixels, x, y, w, h)?;
+                    tracing::info!("Blur applied to region {}x{} at ({}, {})", w, h, x, y);
+                } else {
+                    tracing::warn!("Blur region too small after clamping: {}x{}", w, h);
+                }
+            } else {
+                tracing::warn!("Blur tool has no bounds");
+            }
+        } else {
+            // Commit preview to annotations for other tools
+            if let Ok(ctx) = self.canvas.annotations_surface().context() {
+                self.tool.commit(&ctx, &self.state.properties);
+            }
         }
 
         // Clear preview

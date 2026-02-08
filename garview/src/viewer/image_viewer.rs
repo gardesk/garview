@@ -1188,6 +1188,19 @@ impl ImageViewer {
         backend.render_page(self.current_frame, 1.0).ok()
     }
 
+    /// Get the current page rendered at high resolution for annotation mode.
+    /// For PDFs, renders at 2x scale (144 DPI) for crisp zooming.
+    /// For images, renders at native resolution.
+    pub fn render_for_annotation(&mut self) -> Option<crate::backend::RenderedPage> {
+        let backend = self.backend.as_mut()?;
+        let scale = if backend.format_name() == "PDF" {
+            2.0 // 144 DPI (72 * 2) - good balance of quality and memory
+        } else {
+            1.0
+        };
+        backend.render_page(self.current_frame, scale).ok()
+    }
+
     /// Get the current page rendered at high resolution for export.
     /// For PDFs, renders at 3x scale (216 DPI) for crisp output.
     /// For images, renders at native resolution.

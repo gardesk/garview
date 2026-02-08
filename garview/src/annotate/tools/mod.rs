@@ -3,18 +3,22 @@
 //! Each tool implements the [`Tool`] trait for consistent behavior.
 
 mod arrow;
+mod blur;
 mod brush;
 mod ellipse;
 mod highlight;
 mod line;
 mod rectangle;
+mod text;
 
 pub use arrow::ArrowTool;
+pub use blur::{box_blur, BlurTool};
 pub use brush::BrushTool;
 pub use ellipse::EllipseTool;
 pub use highlight::HighlightTool;
 pub use line::LineTool;
 pub use rectangle::RectangleTool;
+pub use text::TextTool;
 
 use crate::annotate::state::ToolProperties;
 use cairo::Context;
@@ -62,8 +66,8 @@ pub fn create_tool(tool_type: super::state::ToolType) -> Box<dyn Tool> {
         ToolType::Arrow => Box::new(ArrowTool::new()),
         ToolType::Rectangle => Box::new(RectangleTool::new()),
         ToolType::Ellipse => Box::new(EllipseTool::new()),
-        ToolType::Text => Box::new(LineTool::new()), // TODO: TextTool
-        ToolType::Blur => Box::new(RectangleTool::new()), // TODO: BlurTool
+        ToolType::Text => Box::new(TextTool::new()),
+        ToolType::Blur => Box::new(BlurTool::new()),
         ToolType::Highlight => Box::new(HighlightTool::new()),
     }
 }

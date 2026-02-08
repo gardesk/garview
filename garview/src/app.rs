@@ -79,6 +79,12 @@ pub struct App {
     annotation: Option<AnnotationManager>,
     /// Annotation mode active
     annotation_mode: bool,
+    /// Annotation zoom level (1.0 = 100%)
+    annotation_zoom: f64,
+    /// Annotation scroll offset
+    annotation_scroll: (f64, f64),
+    /// Annotation pan drag state (dragging, last_x, last_y)
+    annotation_pan_drag: Option<(i32, i32)>,
     /// Persistent annotation records (shown in sidebar even when not in annotation mode)
     annotation_records: Vec<AnnotationRecord>,
     /// Annotation layer data for overlay (RGBA, width, height)
@@ -215,6 +221,9 @@ impl App {
             properties_panel_active: false,
             annotation: None,
             annotation_mode: false,
+            annotation_zoom: 1.0,
+            annotation_scroll: (0.0, 0.0),
+            annotation_pan_drag: None,
             annotation_records: Vec::new(),
             annotation_overlay: None,
             ipc_server: IpcServer::start().ok(),
@@ -400,6 +409,17 @@ impl App {
                 // Handle annotation mode input first
                 if self.annotation_mode {
                     if let Some(ref mut ann) = self.annotation {
+                        // Forward keyboard input to Text tool when typing
+                        if ann.state.current_tool == ToolType::Text && ann.tool.is_drawing() {
+                            // Pass all keys to tool while typing (Escape cancels text, not exit mode)
+                            if let Ok(redraw) = ann.handle_event(&InputEvent::Key(key_event.clone())) {
+                                if redraw {
+                                    self.needs_redraw = true;
+                                }
+                            }
+                            return Ok(true);
+                        }
+
                         match key_event.key {
                             Key::Escape => {
                                 // Exit annotation mode - save if modified
@@ -433,12 +453,23 @@ impl App {
                                 let idx = (c as u8 - b'1') as usize;
                                 ann.state.set_color_preset(idx);
                             }
-                            // Line width adjustments
-                            Key::Char('+') | Key::Char('=') => {
+                            // Line width adjustments (without Ctrl)
+                            Key::Char('+') | Key::Char('=') if !key_event.modifiers.ctrl => {
                                 ann.state.properties.increase_line_width();
                             }
-                            Key::Char('-') => {
+                            Key::Char('-') if !key_event.modifiers.ctrl => {
                                 ann.state.properties.decrease_line_width();
+                            }
+                            // Zoom (with Ctrl)
+                            Key::Char('+') | Key::Char('=') if key_event.modifiers.ctrl => {
+                                self.annotation_zoom = (self.annotation_zoom * 1.25).min(8.0);
+                            }
+                            Key::Char('-') if key_event.modifiers.ctrl => {
+                                self.annotation_zoom = (self.annotation_zoom / 1.25).max(0.1);
+                            }
+                            Key::Char('0') if key_event.modifiers.ctrl => {
+                                self.annotation_zoom = 1.0;
+                                self.annotation_scroll = (0.0, 0.0);
                             }
                             // Toggle fill mode
                             Key::Char('f') => {
@@ -992,16 +1023,27 @@ impl App {
             InputEvent::MousePress(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // Ctrl+click for pan
+                    if mouse_event.modifiers.ctrl && mouse_event.button == Some(MouseButton::Left) {
+                        self.annotation_pan_drag = Some((mouse_event.position.x, mouse_event.position.y));
+                        return Ok(true);
+                    }
+
                     // Compute offset before mutable borrow
                     let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        // Transform coordinates from window to canvas space
+                        // Transform coordinates from window to canvas space (accounting for zoom)
                         let mut transformed = mouse_event.clone();
-                        transformed.position.x -= offset.0;
-                        transformed.position.y -= offset.1;
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MousePress(transformed)) {
-                            if redraw {
-                                self.needs_redraw = true;
+                        transformed.position.x = ((transformed.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
+                        transformed.position.y = ((transformed.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+                        match ann.handle_event(&InputEvent::MousePress(transformed)) {
+                            Ok(redraw) => {
+                                if redraw {
+                                    self.needs_redraw = true;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Annotation handle_event error: {}", e);
                             }
                         }
                     }
@@ -1155,16 +1197,27 @@ impl App {
             InputEvent::MouseRelease(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // End pan drag
+                    if self.annotation_pan_drag.is_some() {
+                        self.annotation_pan_drag = None;
+                        return Ok(true);
+                    }
+
                     // Compute offset before mutable borrow
                     let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        // Transform coordinates from window to canvas space
+                        // Transform coordinates from window to canvas space (accounting for zoom)
                         let mut transformed = mouse_event.clone();
-                        transformed.position.x -= offset.0;
-                        transformed.position.y -= offset.1;
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseRelease(transformed)) {
-                            if redraw {
-                                self.needs_redraw = true;
+                        transformed.position.x = ((transformed.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
+                        transformed.position.y = ((transformed.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+                        match ann.handle_event(&InputEvent::MouseRelease(transformed)) {
+                            Ok(redraw) => {
+                                if redraw {
+                                    self.needs_redraw = true;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Annotation handle_event error: {}", e);
                             }
                         }
                     }
@@ -1194,16 +1247,32 @@ impl App {
             InputEvent::MouseMove(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
+                    // Handle pan drag
+                    if let Some((last_x, last_y)) = self.annotation_pan_drag {
+                        let dx = mouse_event.position.x - last_x;
+                        let dy = mouse_event.position.y - last_y;
+                        self.annotation_scroll.0 -= dx as f64;
+                        self.annotation_scroll.1 -= dy as f64;
+                        self.annotation_pan_drag = Some((mouse_event.position.x, mouse_event.position.y));
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
+
                     // Compute offset before mutable borrow
                     let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
-                        // Transform coordinates from window to canvas space
+                        // Transform coordinates from window to canvas space (accounting for zoom)
                         let mut transformed = mouse_event.clone();
-                        transformed.position.x -= offset.0;
-                        transformed.position.y -= offset.1;
-                        if let Ok(redraw) = ann.handle_event(&InputEvent::MouseMove(transformed)) {
-                            if redraw {
-                                self.needs_redraw = true;
+                        transformed.position.x = ((transformed.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
+                        transformed.position.y = ((transformed.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+                        match ann.handle_event(&InputEvent::MouseMove(transformed)) {
+                            Ok(redraw) => {
+                                if redraw {
+                                    self.needs_redraw = true;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Annotation handle_event error: {}", e);
                             }
                         }
                     }
@@ -1234,6 +1303,20 @@ impl App {
                     let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
                     let ann_count = self.annotation.as_ref().map(|a| a.annotation_count()).unwrap_or(0);
                     self.sidebar.scroll(scroll_event.delta_y as f64 * 30.0, viewport_height, ann_count);
+                    self.needs_redraw = true;
+                    return Ok(true);
+                }
+
+                // Annotation mode scroll handling
+                if self.annotation_mode {
+                    if scroll_event.modifiers.ctrl {
+                        // Ctrl+scroll = zoom
+                        let factor = if scroll_event.delta_y < 0 { 1.1 } else { 0.9 };
+                        self.annotation_zoom = (self.annotation_zoom * factor).clamp(0.1, 8.0);
+                    } else {
+                        // Regular scroll = pan
+                        self.annotation_scroll.1 += scroll_event.delta_y as f64 * 30.0;
+                    }
                     self.needs_redraw = true;
                     return Ok(true);
                 }
@@ -2047,7 +2130,8 @@ impl App {
             tracing::info!("Exited annotation mode");
         } else {
             // Enter annotation mode - create annotation manager from current image
-            if let Some(rendered) = self.viewer.current_rendered_page() {
+            // Use high-res render for PDFs to allow crisp zooming
+            if let Some(rendered) = self.viewer.render_for_annotation() {
                 let mut ann = AnnotationManager::new(&rendered.data, rendered.width, rendered.height)?;
 
                 // Load existing annotations if they exist
@@ -2089,8 +2173,12 @@ impl App {
 
                 self.annotation = Some(ann);
                 self.annotation_mode = true;
+                // Reset zoom and scroll for annotation mode
+                self.annotation_zoom = 1.0;
+                self.annotation_scroll = (0.0, 0.0);
+                self.annotation_pan_drag = None;
                 tracing::info!("Entered annotation mode - tools: b=brush, l=line, a=arrow, r=rect, e=ellipse, h=highlight");
-                tracing::info!("Colors: 1-9, Size: +/-, Fill: f, Undo: Ctrl+Z, Save: Ctrl+S, Export: Ctrl+E, Exit: Esc/Ctrl+A");
+                tracing::info!("Zoom: Ctrl++/-, Pan: Ctrl+drag, Colors: 1-9, Size: +/-, Undo: Ctrl+Z, Save: Ctrl+S");
             } else {
                 tracing::warn!("Cannot enter annotation mode: no image loaded");
             }
@@ -2105,19 +2193,19 @@ impl App {
             let size = self.renderer.size();
             let viewport_height = size.height.saturating_sub(STATUS_BAR_HEIGHT);
 
-            let canvas_w = ann.canvas.width() as f64;
-            let canvas_h = ann.canvas.height() as f64;
+            let canvas_w = ann.canvas.width() as f64 * self.annotation_zoom;
+            let canvas_h = ann.canvas.height() as f64 * self.annotation_zoom;
 
-            // Calculate centering offset (same as in render)
+            // Calculate centering offset (accounting for zoom and scroll)
             let offset_x = if canvas_w < size.width as f64 {
                 (size.width as f64 - canvas_w) / 2.0
             } else {
-                0.0
+                -self.annotation_scroll.0
             };
             let offset_y = if canvas_h < viewport_height as f64 {
                 (viewport_height as f64 - canvas_h) / 2.0
             } else {
-                0.0
+                -self.annotation_scroll.1
             };
 
             (offset_x as i32, offset_y as i32)
@@ -2388,26 +2476,42 @@ impl App {
                     tracing::error!("Failed to render annotation: {}", e);
                 }
 
-                // Draw composite to window
+                // Draw composite to window with zoom and scroll
                 let composite = ann.canvas.composite_surface();
-                let canvas_w = ann.canvas.width() as f64;
-                let canvas_h = ann.canvas.height() as f64;
+                let canvas_w = ann.canvas.width() as f64 * self.annotation_zoom;
+                let canvas_h = ann.canvas.height() as f64 * self.annotation_zoom;
 
-                // Center in viewport
+                // Calculate position (centered if smaller than viewport, scrollable if larger)
                 let x = if canvas_w < size.width as f64 {
                     (size.width as f64 - canvas_w) / 2.0
                 } else {
-                    0.0
+                    -self.annotation_scroll.0
                 };
                 let y = if canvas_h < viewport_height as f64 {
                     (viewport_height as f64 - canvas_h) / 2.0
                 } else {
-                    0.0
+                    -self.annotation_scroll.1
                 };
 
                 let ctx = self.renderer.context()?;
-                ctx.set_source_surface(composite.cairo_surface(), x, y)?;
+                ctx.save()?;
+
+                // Clip to viewport
+                ctx.rectangle(0.0, 0.0, size.width as f64, viewport_height as f64);
+                ctx.clip();
+
+                // Apply translation and zoom
+                ctx.translate(x, y);
+                ctx.scale(self.annotation_zoom, self.annotation_zoom);
+
+                ctx.set_source_surface(composite.cairo_surface(), 0.0, 0.0)?;
+                // Use nearest-neighbor for crisp pixels when zoomed
+                if self.annotation_zoom > 1.5 {
+                    ctx.source().set_filter(cairo::Filter::Nearest);
+                }
                 ctx.paint()?;
+
+                ctx.restore()?;
 
                 // Draw annotation toolbar at top
                 self.render_annotation_toolbar(&ctx, size.width, &ann)?;

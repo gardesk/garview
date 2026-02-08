@@ -179,4 +179,50 @@ impl AnnotationCanvas {
         ctx.set_operator(cairo::Operator::Over);
         Ok(())
     }
+
+    /// Get a region of the composited image (background + annotations) for blur.
+    ///
+    /// Returns RGBA pixel data for the specified region.
+    pub fn get_region_for_blur(&mut self, x: i32, y: i32, w: u32, h: u32) -> Result<Vec<u8>> {
+        // Compose background + annotations to a temp surface
+        let mut temp = Surface::new(w, h).context("Failed to create temp surface")?;
+
+        // Draw in a scoped block so context is dropped before reading pixels
+        {
+            let ctx = temp.context()?;
+
+            // Draw the region from background
+            ctx.set_source_surface(self.background.cairo_surface(), -x as f64, -y as f64)?;
+            ctx.paint()?;
+
+            // Draw annotations on top
+            ctx.set_operator(cairo::Operator::Over);
+            ctx.set_source_surface(self.annotations.cairo_surface(), -x as f64, -y as f64)?;
+            ctx.paint()?;
+        }
+
+        // Now context is dropped, we can read pixels
+        temp.to_rgba().context("Failed to get region pixels")
+    }
+
+    /// Paint blurred pixels back to the annotations layer.
+    pub fn paint_blurred_region(&self, data: &[u8], x: i32, y: i32, w: u32, h: u32) -> Result<()> {
+        let blurred = Surface::from_rgba(data, w, h)
+            .context("Failed to create blurred surface")?;
+
+        let ctx = self.annotations.context()?;
+        ctx.set_operator(cairo::Operator::Source);
+        ctx.set_source_surface(blurred.cairo_surface(), x as f64, y as f64)?;
+
+        // Paint to the blur region
+        ctx.rectangle(x as f64, y as f64, w as f64, h as f64);
+        ctx.fill()?;
+
+        ctx.set_operator(cairo::Operator::Over);
+
+        // Ensure changes are committed to the surface
+        self.annotations.cairo_surface().flush();
+
+        Ok(())
+    }
 }
