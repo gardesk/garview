@@ -520,10 +520,15 @@ impl App {
                                 }
                             }
                             // Export flattened image (Ctrl+E)
-                            Key::Char('e') if key_event.modifiers.ctrl => {
+                            Key::Char('e') if key_event.modifiers.ctrl && !key_event.modifiers.shift => {
                                 if let Err(e) = self.export_annotated_image() {
                                     tracing::error!("Failed to export annotated image: {}", e);
                                 }
+                            }
+                            // Export format dialog (Ctrl+Shift+E)
+                            Key::Char('E') if key_event.modifiers.ctrl => {
+                                self.export_dialog_active = true;
+                                self.export_dialog_selected = 0;
                             }
                             // Clear all annotations
                             Key::Delete | Key::Char('c') if key_event.modifiers.ctrl && key_event.modifiers.shift => {
