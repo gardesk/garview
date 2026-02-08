@@ -1065,13 +1065,23 @@ impl App {
                     let canvas_y = ((mouse_event.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
 
                     if mouse_event.button == Some(MouseButton::Left) {
-                        // Ctrl+click for rubber band selection
+                        // Ctrl+click - toggle selection or start rubber band
                         if mouse_event.modifiers.ctrl {
-                            self.annotation_rubber_band = Some((canvas_x, canvas_y, canvas_x, canvas_y));
-                            // Deselect current selection when starting rubber band
-                            if let Some(ref mut ann) = self.annotation {
-                                ann.select(None);
+                            // First check if clicking on an existing annotation
+                            if let Some(ref ann) = self.annotation {
+                                if let Some(record) = ann.annotation_at(canvas_x, canvas_y, current_page) {
+                                    // Toggle this annotation in the selection
+                                    let id = record.id;
+                                    if let Some(ref mut ann) = self.annotation {
+                                        let selected = ann.toggle_selection(id);
+                                        tracing::debug!("Ctrl+click toggled annotation {} (now {})", id, if selected { "selected" } else { "deselected" });
+                                    }
+                                    self.needs_redraw = true;
+                                    return Ok(true);
+                                }
                             }
+                            // Not on annotation - start rubber band selection
+                            self.annotation_rubber_band = Some((canvas_x, canvas_y, canvas_x, canvas_y));
                             self.needs_redraw = true;
                             return Ok(true);
                         }

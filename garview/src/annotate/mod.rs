@@ -195,10 +195,27 @@ impl AnnotationManager {
         self.selected_annotations = ids;
     }
 
-    /// Add an annotation to selection (for Shift+click multi-select).
+    /// Add an annotation to selection (for Ctrl+click multi-select).
     pub fn add_to_selection(&mut self, id: u64) {
         if !self.selected_annotations.contains(&id) {
             self.selected_annotations.push(id);
+        }
+    }
+
+    /// Remove an annotation from selection.
+    pub fn remove_from_selection(&mut self, id: u64) {
+        self.selected_annotations.retain(|&x| x != id);
+    }
+
+    /// Toggle an annotation's selection state.
+    /// Returns true if the annotation is now selected, false if deselected.
+    pub fn toggle_selection(&mut self, id: u64) -> bool {
+        if self.selected_annotations.contains(&id) {
+            self.selected_annotations.retain(|&x| x != id);
+            false
+        } else {
+            self.selected_annotations.push(id);
+            true
         }
     }
 
