@@ -4,6 +4,36 @@ use gartk_core::{Color, Rect};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Calculate the shortest distance from a point to a line segment.
+fn point_to_line_distance(px: i32, py: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> f64 {
+    let px = px as f64;
+    let py = py as f64;
+    let x1 = x1 as f64;
+    let y1 = y1 as f64;
+    let x2 = x2 as f64;
+    let y2 = y2 as f64;
+
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len_sq = dx * dx + dy * dy;
+
+    if len_sq < 0.0001 {
+        // Line segment is essentially a point
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+
+    // Project point onto line, clamped to segment
+    let t = ((px - x1) * dx + (py - y1) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+
+    // Closest point on segment
+    let closest_x = x1 + t * dx;
+    let closest_y = y1 + t * dy;
+
+    // Distance to closest point
+    ((px - closest_x).powi(2) + (py - closest_y).powi(2)).sqrt()
+}
+
 /// Serializable annotation record for JSON persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableAnnotation {
@@ -16,6 +46,12 @@ pub struct SerializableAnnotation {
     pub color: [f64; 4], // RGBA
     pub page: usize,
     pub timestamp: u64, // Seconds since epoch
+    /// Start point for line-based tools (x, y).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_point: Option<(i32, i32)>,
+    /// End point for line-based tools (x, y).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_point: Option<(i32, i32)>,
 }
 
 impl SerializableAnnotation {
@@ -35,6 +71,8 @@ impl SerializableAnnotation {
             color: [record.color.r, record.color.g, record.color.b, record.color.a],
             page: record.page,
             timestamp,
+            start_point: record.start_point,
+            end_point: record.end_point,
         }
     }
 
@@ -51,6 +89,8 @@ impl SerializableAnnotation {
             color,
             page: self.page,
             timestamp,
+            start_point: self.start_point,
+            end_point: self.end_point,
         }
     }
 }
@@ -70,6 +110,10 @@ pub struct AnnotationRecord {
     pub page: usize,
     /// When this annotation was created.
     pub timestamp: SystemTime,
+    /// Start point for line-based tools (Arrow, Line).
+    pub start_point: Option<(i32, i32)>,
+    /// End point for line-based tools (Arrow, Line).
+    pub end_point: Option<(i32, i32)>,
 }
 
 impl AnnotationRecord {
@@ -82,6 +126,83 @@ impl AnnotationRecord {
             color,
             page,
             timestamp: SystemTime::now(),
+            start_point: None,
+            end_point: None,
+        }
+    }
+
+    /// Create a new annotation record with line endpoints.
+    pub fn new_with_endpoints(
+        id: u64,
+        tool: ToolType,
+        bounds: Rect,
+        color: Color,
+        page: usize,
+        start: (i32, i32),
+        end: (i32, i32),
+    ) -> Self {
+        Self {
+            id,
+            tool,
+            bounds,
+            color,
+            page,
+            timestamp: SystemTime::now(),
+            start_point: Some(start),
+            end_point: Some(end),
+        }
+    }
+
+    /// Check if a point is near this annotation (for selection).
+    /// Uses geometry-aware hit-testing for line-based tools.
+    pub fn contains_point(&self, x: i32, y: i32, tolerance: f64) -> bool {
+        match self.tool {
+            ToolType::Arrow | ToolType::Line => {
+                // For lines, check distance to line segment
+                if let (Some((x1, y1)), Some((x2, y2))) = (self.start_point, self.end_point) {
+                    let dist = point_to_line_distance(x, y, x1, y1, x2, y2);
+                    dist <= tolerance
+                } else {
+                    // Fallback to bounding box if no endpoints stored
+                    self.bounds.contains_point(gartk_core::Point::new(x, y))
+                }
+            }
+            ToolType::Rectangle => {
+                // For rectangles, check if near edges (within tolerance of border)
+                let b = &self.bounds;
+                let in_bounds = x >= b.x - tolerance as i32
+                    && x <= b.x + b.width as i32 + tolerance as i32
+                    && y >= b.y - tolerance as i32
+                    && y <= b.y + b.height as i32 + tolerance as i32;
+                if !in_bounds {
+                    return false;
+                }
+                // Check if near any edge
+                let near_left = (x - b.x).abs() <= tolerance as i32;
+                let near_right = (x - (b.x + b.width as i32)).abs() <= tolerance as i32;
+                let near_top = (y - b.y).abs() <= tolerance as i32;
+                let near_bottom = (y - (b.y + b.height as i32)).abs() <= tolerance as i32;
+                near_left || near_right || near_top || near_bottom
+            }
+            ToolType::Ellipse => {
+                // For ellipses, check distance to ellipse curve
+                let b = &self.bounds;
+                let cx = b.x as f64 + b.width as f64 / 2.0;
+                let cy = b.y as f64 + b.height as f64 / 2.0;
+                let rx = b.width as f64 / 2.0;
+                let ry = b.height as f64 / 2.0;
+                if rx < 1.0 || ry < 1.0 {
+                    return false;
+                }
+                // Normalized distance from center (1.0 = on ellipse)
+                let dx = (x as f64 - cx) / rx;
+                let dy = (y as f64 - cy) / ry;
+                let dist = (dx * dx + dy * dy).sqrt();
+                // Check if near the ellipse curve (not inside or far outside)
+                (dist - 1.0).abs() * rx.min(ry) <= tolerance
+            }
+            // For other tools (Text, Blur, Brush, Highlight), use bounding box
+            _ => self.bounds.contains_point(gartk_core::Point::new(x, y)),
         }
     }
 

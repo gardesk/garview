@@ -205,6 +205,24 @@ impl AnnotationCanvas {
         temp.to_rgba().context("Failed to get region pixels")
     }
 
+    /// Erase a region from the annotations layer (fill with transparency).
+    pub fn erase_region(&self, x: i32, y: i32, w: u32, h: u32) -> Result<()> {
+        let ctx = self.annotations.context()?;
+
+        // Use CLEAR operator to make region fully transparent
+        ctx.set_operator(cairo::Operator::Clear);
+        ctx.rectangle(x as f64, y as f64, w as f64, h as f64);
+        ctx.fill()?;
+
+        // Reset operator
+        ctx.set_operator(cairo::Operator::Over);
+
+        // Ensure changes are committed to the surface
+        self.annotations.cairo_surface().flush();
+
+        Ok(())
+    }
+
     /// Paint blurred pixels back to the annotations layer.
     pub fn paint_blurred_region(&self, data: &[u8], x: i32, y: i32, w: u32, h: u32) -> Result<()> {
         let blurred = Surface::from_rgba(data, w, h)
