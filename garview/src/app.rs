@@ -2625,6 +2625,15 @@ impl App {
                         value
                     };
 
+                    // Cover PDF's native text rendering with white fill (small inset to preserve borders)
+                    // Only do this for fields that have content (either our buffer or saved value)
+                    if !text.is_empty() || !value.is_empty() {
+                        ctx.set_source_rgb(1.0, 1.0, 1.0);
+                        let inset = 1.0 * zoom;
+                        ctx.rectangle(rect_x + inset, rect_y + inset, rect_w - 2.0 * inset, rect_h - 2.0 * inset);
+                        ctx.fill()?;
+                    }
+
                     if !text.is_empty() {
                         ctx.set_source_rgb(0.0, 0.0, 0.0);
 
