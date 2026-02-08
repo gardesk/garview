@@ -1188,6 +1188,19 @@ impl ImageViewer {
         backend.render_page(self.current_frame, 1.0).ok()
     }
 
+    /// Get the current page rendered at high resolution for export.
+    /// For PDFs, renders at 3x scale (216 DPI) for crisp output.
+    /// For images, renders at native resolution.
+    pub fn render_page_for_export(&mut self) -> Option<crate::backend::RenderedPage> {
+        let backend = self.backend.as_mut()?;
+        let scale = if backend.format_name() == "PDF" {
+            3.0 // 216 DPI (72 * 3)
+        } else {
+            1.0
+        };
+        backend.render_page(self.current_frame, scale).ok()
+    }
+
     /// Get the current page as PNG bytes for clipboard
     pub fn current_page_png(&mut self) -> Result<Vec<u8>> {
         let backend = self.backend.as_mut().ok_or_else(|| anyhow!("No backend"))?;

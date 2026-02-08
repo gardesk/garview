@@ -89,6 +89,10 @@ pub struct App {
     form_state: Option<FormState>,
     /// Last form field click (time, field_id) for double-click detection
     last_form_click: Option<(std::time::Instant, i32)>,
+    /// Export format dialog active
+    export_dialog_active: bool,
+    /// Selected format index in export dialog (0=PNG, 1=JPEG, 2=PDF)
+    export_dialog_selected: usize,
 }
 
 impl App {
@@ -216,6 +220,8 @@ impl App {
             ipc_server: IpcServer::start().ok(),
             form_state: None,
             last_form_click: None,
+            export_dialog_active: false,
+            export_dialog_selected: 0,
         })
     }
 
@@ -702,6 +708,56 @@ impl App {
                     return Ok(true);
                 }
 
+                // Export format dialog input
+                if self.export_dialog_active {
+                    match key_event.key {
+                        Key::Escape => {
+                            self.export_dialog_active = false;
+                            self.needs_redraw = true;
+                        }
+                        Key::Return => {
+                            let format = match self.export_dialog_selected {
+                                0 => "png",
+                                1 => "jpeg",
+                                2 => "pdf",
+                                _ => "png",
+                            };
+                            self.export_dialog_active = false;
+                            match self.export_current_page(format) {
+                                Ok(()) => {}
+                                Err(e) => tracing::error!("Export failed: {}", e),
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Up | Key::Char('k') => {
+                            if self.export_dialog_selected > 0 {
+                                self.export_dialog_selected -= 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Down | Key::Char('j') => {
+                            if self.export_dialog_selected < 2 {
+                                self.export_dialog_selected += 1;
+                            }
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('1') => {
+                            self.export_dialog_selected = 0;
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('2') => {
+                            self.export_dialog_selected = 1;
+                            self.needs_redraw = true;
+                        }
+                        Key::Char('3') => {
+                            self.export_dialog_selected = 2;
+                            self.needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                    return Ok(true);
+                }
+
                 // Go to page dialog input
                 if self.goto_page_active {
                     match key_event.key {
@@ -890,12 +946,18 @@ impl App {
                         return Ok(true);
                     }
                     // Export current page as PNG (Ctrl+E, outside annotation mode)
-                    Key::Char('e') if key_event.modifiers.ctrl && !self.annotation_mode => {
-                        let format = if key_event.modifiers.shift { "jpeg" } else { "png" };
-                        match self.export_current_page(format) {
+                    Key::Char('e') if key_event.modifiers.ctrl && !self.annotation_mode && !key_event.modifiers.shift => {
+                        match self.export_current_page("png") {
                             Ok(()) => {}
                             Err(e) => tracing::error!("Export failed: {}", e),
                         }
+                        return Ok(true);
+                    }
+                    // Export dialog (Ctrl+Shift+E)
+                    Key::Char('E') if key_event.modifiers.ctrl && !self.annotation_mode => {
+                        self.export_dialog_active = true;
+                        self.export_dialog_selected = 0;
+                        self.needs_redraw = true;
                         return Ok(true);
                     }
                     Key::Tab | Key::Char('g') => {
@@ -2180,18 +2242,27 @@ impl App {
         Ok(())
     }
 
-    /// Export current page/view as image (PNG or JPEG)
+    /// Export current page/view as image (PNG, JPEG, or PDF)
     fn export_current_page(&mut self, format: &str) -> Result<()> {
         let input_path = self.viewer.current_path().context("No file loaded")?;
         let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
         let parent = input_path.parent().unwrap_or(Path::new("."));
 
-        let (ext, output_path) = match format.to_lowercase().as_str() {
-            "jpeg" | "jpg" => ("jpg", parent.join(format!("{}_export.jpg", stem))),
-            _ => ("png", parent.join(format!("{}_export.png", stem))),
+        let output_path = match format.to_lowercase().as_str() {
+            "jpeg" | "jpg" => parent.join(format!("{}_export.jpg", stem)),
+            "pdf" => parent.join(format!("{}_export.pdf", stem)),
+            _ => parent.join(format!("{}_export.png", stem)),
         };
 
-        if let Some(rendered) = self.viewer.current_rendered_page() {
+        // For PDF export, use high-resolution rendering
+        let is_pdf_export = format.to_lowercase() == "pdf";
+        let rendered = if is_pdf_export {
+            self.viewer.render_page_for_export()
+        } else {
+            self.viewer.current_rendered_page()
+        };
+
+        if let Some(rendered) = rendered {
             let mut img = image::RgbaImage::from_raw(
                 rendered.width,
                 rendered.height,
@@ -2208,7 +2279,18 @@ impl App {
                             ann.canvas.height(),
                             ann_data,
                         ) {
-                            image::imageops::overlay(&mut img, &overlay, 0, 0);
+                            // Scale overlay if exporting high-res PDF
+                            if is_pdf_export && (overlay.width() != img.width() || overlay.height() != img.height()) {
+                                let scaled = image::imageops::resize(
+                                    &overlay,
+                                    img.width(),
+                                    img.height(),
+                                    image::imageops::FilterType::Lanczos3,
+                                );
+                                image::imageops::overlay(&mut img, &scaled, 0, 0);
+                            } else {
+                                image::imageops::overlay(&mut img, &overlay, 0, 0);
+                            }
                         }
                     }
                 }
@@ -2219,16 +2301,68 @@ impl App {
                     overlay_h,
                     overlay_data.clone(),
                 ) {
-                    image::imageops::overlay(&mut img, &overlay, 0, 0);
+                    // Scale overlay if exporting high-res PDF
+                    if is_pdf_export && (overlay.width() != img.width() || overlay.height() != img.height()) {
+                        let scaled = image::imageops::resize(
+                            &overlay,
+                            img.width(),
+                            img.height(),
+                            image::imageops::FilterType::Lanczos3,
+                        );
+                        image::imageops::overlay(&mut img, &scaled, 0, 0);
+                    } else {
+                        image::imageops::overlay(&mut img, &overlay, 0, 0);
+                    }
                 }
             }
 
-            if ext == "jpg" {
-                // Convert to RGB for JPEG
-                let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-                rgb.save(&output_path)?;
-            } else {
-                img.save(&output_path)?;
+            match format.to_lowercase().as_str() {
+                "jpeg" | "jpg" => {
+                    // Convert to RGB for JPEG
+                    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+                    rgb.save(&output_path)?;
+                }
+                "pdf" => {
+                    // Export as PDF using Cairo
+                    let width = img.width() as f64;
+                    let height = img.height() as f64;
+
+                    let pdf_surface = PdfSurface::new(width, height, &output_path)
+                        .context("Failed to create PDF surface")?;
+                    let ctx = cairo::Context::new(&pdf_surface)
+                        .context("Failed to create Cairo context")?;
+
+                    // Create image surface from RGBA data
+                    // Cairo expects BGRA, so we need to convert
+                    let mut bgra_data: Vec<u8> = Vec::with_capacity(img.len());
+                    for pixel in img.chunks(4) {
+                        bgra_data.push(pixel[2]); // B
+                        bgra_data.push(pixel[1]); // G
+                        bgra_data.push(pixel[0]); // R
+                        bgra_data.push(pixel[3]); // A
+                    }
+
+                    let stride = cairo::Format::ARgb32.stride_for_width(img.width()).unwrap();
+                    let image_surface = cairo::ImageSurface::create_for_data(
+                        bgra_data,
+                        cairo::Format::ARgb32,
+                        img.width() as i32,
+                        img.height() as i32,
+                        stride,
+                    ).context("Failed to create image surface")?;
+
+                    ctx.set_source_surface(&image_surface, 0.0, 0.0)?;
+                    // Use nearest-neighbor filtering for crisp output
+                    ctx.source().set_filter(cairo::Filter::Nearest);
+                    ctx.paint()?;
+
+                    // Ensure surface is fully written before finishing
+                    pdf_surface.flush();
+                    pdf_surface.finish();
+                }
+                _ => {
+                    img.save(&output_path)?;
+                }
             }
 
             tracing::info!("Exported to: {}", output_path.display());
@@ -2344,6 +2478,11 @@ impl App {
         // Render go to page dialog if active
         if self.goto_page_active {
             self.render_goto_page_dialog(size.width)?;
+        }
+
+        // Render export format dialog if active
+        if self.export_dialog_active {
+            self.render_export_dialog(size.width, size.height)?;
         }
 
         // Render recent files panel if active
@@ -3479,6 +3618,100 @@ impl App {
         ctx.move_to(input_x + input_extents.width() + 2.0, dialog_y + 8.0);
         ctx.line_to(input_x + input_extents.width() + 2.0, dialog_y + dialog_height - 8.0);
         ctx.stroke()?;
+
+        ctx.restore()?;
+        Ok(())
+    }
+
+    fn render_export_dialog(&mut self, width: u32, height: u32) -> Result<()> {
+        let ctx = self.renderer.context()?;
+
+        // Dialog dimensions
+        let dialog_width = 280.0_f64.min(width as f64 - 40.0);
+        let dialog_height = 160.0;
+        let dialog_x = (width as f64 - dialog_width) / 2.0;
+        let dialog_y = (height as f64 - dialog_height) / 2.0;
+        let padding = 16.0;
+        let radius = 8.0;
+        let item_height = 32.0;
+
+        ctx.save()?;
+
+        // Draw semi-transparent overlay
+        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.4);
+        ctx.rectangle(0.0, 0.0, width as f64, height as f64);
+        ctx.fill()?;
+
+        // Draw dialog background with rounded corners
+        ctx.new_path();
+        ctx.arc(dialog_x + radius, dialog_y + radius, radius, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+        ctx.arc(dialog_x + dialog_width - radius, dialog_y + radius, radius, 1.5 * std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+        ctx.arc(dialog_x + dialog_width - radius, dialog_y + dialog_height - radius, radius, 0.0, 0.5 * std::f64::consts::PI);
+        ctx.arc(dialog_x + radius, dialog_y + dialog_height - radius, radius, 0.5 * std::f64::consts::PI, std::f64::consts::PI);
+        ctx.close_path();
+
+        // Fill background
+        ctx.set_source_rgba(0.15, 0.15, 0.17, 0.98);
+        ctx.fill_preserve()?;
+
+        // Draw border
+        ctx.set_source_rgb(0.4, 0.4, 0.4);
+        ctx.set_line_width(1.0);
+        ctx.stroke()?;
+
+        // Draw title
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Bold,
+        );
+        ctx.set_font_size(14.0);
+        ctx.set_source_rgb(0.9, 0.9, 0.9);
+        ctx.move_to(dialog_x + padding, dialog_y + padding + 12.0);
+        ctx.show_text("Export As...")?;
+
+        // Draw format options
+        ctx.select_font_face(
+            "sans-serif",
+            gartk_render::cairo::FontSlant::Normal,
+            gartk_render::cairo::FontWeight::Normal,
+        );
+        ctx.set_font_size(13.0);
+
+        let formats = [
+            ("1. PNG", "Lossless, with transparency"),
+            ("2. JPEG", "Smaller file, lossy compression"),
+            ("3. PDF", "Portable document format"),
+        ];
+
+        let start_y = dialog_y + padding + 36.0;
+        for (i, (name, desc)) in formats.iter().enumerate() {
+            let y = start_y + i as f64 * item_height;
+            let is_selected = i == self.export_dialog_selected;
+
+            // Selection highlight
+            if is_selected {
+                ctx.set_source_rgba(0.3, 0.5, 0.8, 0.3);
+                ctx.rectangle(dialog_x + 4.0, y - 4.0, dialog_width - 8.0, item_height - 2.0);
+                ctx.fill()?;
+            }
+
+            // Format name
+            if is_selected {
+                ctx.set_source_rgb(0.6, 0.8, 1.0);
+            } else {
+                ctx.set_source_rgb(0.8, 0.8, 0.8);
+            }
+            ctx.move_to(dialog_x + padding, y + 12.0);
+            ctx.show_text(name)?;
+
+            // Description
+            ctx.set_source_rgb(0.5, 0.5, 0.5);
+            ctx.set_font_size(11.0);
+            ctx.move_to(dialog_x + padding + 70.0, y + 12.0);
+            ctx.show_text(desc)?;
+            ctx.set_font_size(13.0);
+        }
 
         ctx.restore()?;
         Ok(())
