@@ -598,7 +598,7 @@ impl Backend for PdfBackend {
 
             let result = ffi::poppler_document_save(
                 doc_ptr,
-                uri_cstring.as_ptr() as *const u8,
+                uri_cstring.as_ptr().cast(),
                 &mut error,
             );
 
