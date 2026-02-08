@@ -575,7 +575,7 @@ impl Backend for PdfBackend {
     }
 
     fn save_document(&self, path: &Path) -> Result<()> {
-        let _doc = self
+        let doc = self
             .document
             .as_ref()
             .ok_or_else(|| anyhow!("No document loaded"))?;
@@ -583,17 +583,19 @@ impl Backend for PdfBackend {
         let abs_path = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf());
-        let uri = format!("file://{}", abs_path.display());
 
-        // poppler-rs Document::save() method
-        // Note: This requires the document to be opened with write permissions
+        // Poppler can't save over the file it has open, so save to a temp file first
+        let parent = abs_path.parent().unwrap_or(Path::new("."));
+        let file_name = abs_path.file_name().unwrap_or_default().to_string_lossy();
+        let temp_path = parent.join(format!(".{}.tmp", file_name));
+        let temp_uri = format!("file://{}", temp_path.display());
+
         unsafe {
-            let doc_ptr: *mut ffi::PopplerDocument = _doc.to_glib_none().0;
-            let uri_cstring = std::ffi::CString::new(uri.as_bytes())
+            let doc_ptr: *mut ffi::PopplerDocument = doc.to_glib_none().0;
+            let uri_cstring = std::ffi::CString::new(temp_uri.as_bytes())
                 .map_err(|_| anyhow!("Invalid URI"))?;
             let mut error: *mut cairo::glib::ffi::GError = std::ptr::null_mut();
 
-            // Use poppler_document_save
             let result = ffi::poppler_document_save(
                 doc_ptr,
                 uri_cstring.as_ptr() as *const u8,
@@ -606,9 +608,13 @@ impl Backend for PdfBackend {
                     cairo::glib::ffi::g_error_free(error);
                     return Err(anyhow!("Failed to save PDF: {}", msg));
                 }
-                return Err(anyhow!("Failed to save PDF"));
+                return Err(anyhow!("Failed to save PDF (unknown error)"));
             }
         }
+
+        // Rename temp file to target path
+        std::fs::rename(&temp_path, &abs_path)
+            .map_err(|e| anyhow!("Failed to rename temp file: {}", e))?;
 
         Ok(())
     }
