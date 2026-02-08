@@ -12,8 +12,9 @@ pub use history::History;
 pub use state::{AnnotationState, ToolProperties, ToolType};
 pub use tools::{create_tool, Tool};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gartk_core::InputEvent;
+use std::path::Path;
 
 /// Annotation manager combining canvas, tools, and history.
 pub struct AnnotationManager {
@@ -25,6 +26,8 @@ pub struct AnnotationManager {
     pub state: AnnotationState,
     /// Undo/redo history.
     pub history: History,
+    /// Whether annotations have been modified since last save.
+    pub modified: bool,
 }
 
 impl AnnotationManager {
@@ -40,7 +43,72 @@ impl AnnotationManager {
             tool,
             state,
             history,
+            modified: false,
         })
+    }
+
+    /// Get the sidecar annotation file path for a given file.
+    pub fn annotation_path(file_path: &Path) -> std::path::PathBuf {
+        let mut path = file_path.to_path_buf();
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".annotations.png");
+        path.set_file_name(name);
+        path
+    }
+
+    /// Check if annotations exist for a file.
+    pub fn has_annotations(file_path: &Path) -> bool {
+        Self::annotation_path(file_path).exists()
+    }
+
+    /// Load existing annotations from sidecar file.
+    pub fn load_annotations(file_path: &Path) -> Result<Option<Vec<u8>>> {
+        let ann_path = Self::annotation_path(file_path);
+        if !ann_path.exists() {
+            return Ok(None);
+        }
+
+        let img = image::open(&ann_path)
+            .with_context(|| format!("Failed to load annotations from {:?}", ann_path))?;
+        let rgba = img.to_rgba8();
+        Ok(Some(rgba.into_raw()))
+    }
+
+    /// Save annotations to sidecar file.
+    pub fn save_annotations(&mut self, file_path: &Path) -> Result<()> {
+        let ann_path = Self::annotation_path(file_path);
+        let data = self.canvas.snapshot_annotations()?;
+        let width = self.canvas.width();
+        let height = self.canvas.height();
+
+        // Check if annotations are empty (all transparent)
+        let is_empty = data.chunks(4).all(|px| px[3] == 0);
+        if is_empty {
+            // Delete sidecar file if it exists and annotations are empty
+            if ann_path.exists() {
+                std::fs::remove_file(&ann_path)?;
+            }
+            self.modified = false;
+            return Ok(());
+        }
+
+        // Save as PNG
+        image::save_buffer(
+            &ann_path,
+            &data,
+            width,
+            height,
+            image::ColorType::Rgba8,
+        ).with_context(|| format!("Failed to save annotations to {:?}", ann_path))?;
+
+        self.modified = false;
+        tracing::info!("Saved annotations to {:?}", ann_path);
+        Ok(())
+    }
+
+    /// Restore annotations from loaded data.
+    pub fn restore_from_data(&self, data: &[u8]) -> Result<()> {
+        self.canvas.restore_annotations(data)
     }
 
     /// Handle an input event.
@@ -83,6 +151,9 @@ impl AnnotationManager {
         // Reset tool
         self.tool.reset();
 
+        // Mark as modified
+        self.modified = true;
+
         Ok(())
     }
 
@@ -101,6 +172,7 @@ impl AnnotationManager {
         let current = self.canvas.snapshot_annotations()?;
         if let Some(previous) = self.history.undo(current) {
             self.canvas.restore_annotations(&previous)?;
+            self.modified = true;
             Ok(true)
         } else {
             Ok(false)
@@ -112,6 +184,7 @@ impl AnnotationManager {
         let current = self.canvas.snapshot_annotations()?;
         if let Some(next) = self.history.redo(current) {
             self.canvas.restore_annotations(&next)?;
+            self.modified = true;
             Ok(true)
         } else {
             Ok(false)
@@ -146,6 +219,7 @@ impl AnnotationManager {
 
         self.canvas.clear_annotations()?;
         self.tool.reset();
+        self.modified = true;
 
         Ok(())
     }
