@@ -751,19 +751,23 @@ impl App {
                             // Clone path to avoid borrow conflict
                             let path = self.viewer.current_path().map(|p| p.to_path_buf());
                             if let Some(path) = path {
-                                if let Some(backend) = self.viewer.backend_mut() {
-                                    match backend.save_document(&path) {
-                                        Ok(()) => {
-                                            tracing::info!("Saved document: {}", path.display());
-                                            // Clear modified flag
-                                            if let Some(ref mut fs) = self.form_state {
-                                                fs.modified = false;
-                                            }
+                                let save_result = self.viewer.backend_mut()
+                                    .map(|b| b.save_document(&path));
+                                match save_result {
+                                    Some(Ok(())) => {
+                                        tracing::info!("Saved document: {}", path.display());
+                                        // Clear modified flag
+                                        if let Some(ref mut fs) = self.form_state {
+                                            fs.modified = false;
                                         }
-                                        Err(e) => {
-                                            tracing::error!("Failed to save document: {}", e);
-                                        }
+                                        // Invalidate page cache so poppler re-renders with new values
+                                        self.viewer.invalidate_page_cache();
+                                        self.needs_redraw = true;
                                     }
+                                    Some(Err(e)) => {
+                                        tracing::error!("Failed to save document: {}", e);
+                                    }
+                                    None => {}
                                 }
                             }
                         }
@@ -2571,8 +2575,23 @@ impl App {
             None => return Ok(()),
         };
 
-        let ctx = self.renderer.context()?;
+        // Only render overlay for the focused field - let poppler render unfocused fields natively
+        let focused_id = match form_state.focused_field {
+            Some(id) => id,
+            None => return Ok(()), // No focused field = no overlay needed
+        };
 
+        let field = match form_state.field_by_id(focused_id) {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+
+        // Only render if field is on current page
+        if field.page != page {
+            return Ok(());
+        }
+
+        let ctx = self.renderer.context()?;
         ctx.save()?;
 
         // Clip to viewport
@@ -2582,183 +2601,136 @@ impl App {
         // Translate to page position
         ctx.translate(x, y);
 
-        // Render each form field on this page
-        for field in form_state.fields.iter().filter(|f| f.page == page) {
-            let (pdf_x1, pdf_y1, pdf_x2, pdf_y2) = field.rect;
+        // Calculate field rectangle
+        let (pdf_x1, pdf_y1, pdf_x2, pdf_y2) = field.rect;
+        let screen_y1 = page_height - pdf_y2;
+        let screen_y2 = page_height - pdf_y1;
+        let rect_x = pdf_x1 * zoom;
+        let rect_y = screen_y1 * zoom;
+        let rect_w = (pdf_x2 - pdf_x1) * zoom;
+        let rect_h = (screen_y2 - screen_y1) * zoom;
 
-            // Convert PDF coordinates (Y=0 at bottom) to screen coordinates
-            let screen_y1 = page_height - pdf_y2;
-            let screen_y2 = page_height - pdf_y1;
+        // Draw focus highlight
+        ctx.set_source_rgba(0.2, 0.4, 0.8, 0.3);
+        ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+        ctx.fill()?;
 
-            // Apply zoom
-            let rect_x = pdf_x1 * zoom;
-            let rect_y = screen_y1 * zoom;
-            let rect_w = (pdf_x2 - pdf_x1) * zoom;
-            let rect_h = (screen_y2 - screen_y1) * zoom;
+        ctx.set_source_rgba(0.2, 0.4, 0.8, 0.9);
+        ctx.set_line_width(2.0);
+        ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
+        ctx.stroke()?;
 
-            let is_focused = form_state.focused_field == Some(field.id);
+        // Draw field content based on type
+        match &field.field_type {
+            crate::forms::FormFieldType::Text { max_len, .. } => {
+                let text = &form_state.text_buffer;
 
-            // Draw field boundary
-            if is_focused {
-                // Focused field: blue with thicker border
-                ctx.set_source_rgba(0.2, 0.4, 0.8, 0.3);
-                ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
-                ctx.fill()?;
+                // Cover PDF's native text rendering with white fill
+                // Skip for character-spaced fields (SSN boxes etc.) to preserve grid lines
+                let uses_char_spacing = max_len.map(|m| m > 0 && m <= 10).unwrap_or(false);
+                if !uses_char_spacing {
+                    ctx.set_source_rgb(1.0, 1.0, 1.0);
+                    let inset = 1.0 * zoom;
+                    ctx.rectangle(rect_x + inset, rect_y + inset, rect_w - 2.0 * inset, rect_h - 2.0 * inset);
+                    ctx.fill()?;
+                }
 
-                ctx.set_source_rgba(0.2, 0.4, 0.8, 0.9);
-                ctx.set_line_width(2.0);
-            } else {
-                // Non-focused field: subtle border
-                ctx.set_source_rgba(0.3, 0.3, 0.3, 0.3);
-                ctx.set_line_width(1.0);
-            }
-            ctx.rectangle(rect_x, rect_y, rect_w, rect_h);
-            ctx.stroke()?;
+                // Calculate font size
+                let font_size = if field.font_size > 0.0 {
+                    field.font_size * zoom
+                } else {
+                    (rect_h * 0.7).min(14.0 * zoom)
+                };
 
-            // Draw field content based on type
-            match &field.field_type {
-                crate::forms::FormFieldType::Text { value, max_len, .. } => {
-                    // Render text content (or text buffer if focused)
-                    let text = if is_focused {
-                        &form_state.text_buffer
-                    } else {
-                        value
-                    };
+                ctx.select_font_face(
+                    "Sans",
+                    gartk_render::cairo::FontSlant::Normal,
+                    gartk_render::cairo::FontWeight::Normal,
+                );
+                ctx.set_font_size(font_size);
 
-                    // Cover PDF's native text rendering with white fill (small inset to preserve borders)
-                    // Skip for character-spaced fields (SSN boxes etc.) to preserve grid lines
-                    let uses_char_spacing = max_len.map(|m| m > 0 && m <= 10).unwrap_or(false);
-                    if !uses_char_spacing && (!text.is_empty() || !value.is_empty()) {
-                        ctx.set_source_rgb(1.0, 1.0, 1.0);
-                        let inset = 1.0 * zoom;
-                        ctx.rectangle(rect_x + inset, rect_y + inset, rect_w - 2.0 * inset, rect_h - 2.0 * inset);
-                        ctx.fill()?;
-                    }
+                // Center text vertically
+                let extents = ctx.font_extents()?;
+                let text_y = rect_y + (rect_h + extents.height()) / 2.0 - extents.descent();
 
-                    if !text.is_empty() {
-                        ctx.set_source_rgb(0.0, 0.0, 0.0);
+                // Render text
+                if !text.is_empty() {
+                    ctx.set_source_rgb(0.0, 0.0, 0.0);
 
-                        // Calculate font size based on field height
-                        let font_size = if field.font_size > 0.0 {
-                            field.font_size * zoom
-                        } else {
-                            (rect_h * 0.7).min(14.0 * zoom)
-                        };
-
-                        ctx.select_font_face(
-                            "Sans",
-                            gartk_render::cairo::FontSlant::Normal,
-                            gartk_render::cairo::FontWeight::Normal,
-                        );
-                        ctx.set_font_size(font_size);
-
-                        // Center text vertically using font metrics
-                        let extents = ctx.font_extents()?;
-                        let text_y = rect_y + (rect_h + extents.height()) / 2.0 - extents.descent();
-
-                        // Check if we should use character spacing (for fields with max_len like SSN boxes)
-                        if let Some(max) = max_len {
-                            if *max > 0 && *max <= 10 {
-                                // Fixed character spacing - divide field width by max chars
-                                let char_width = rect_w / (*max as f64);
-                                for (i, ch) in text.chars().enumerate() {
-                                    if i >= *max as usize {
-                                        break;
-                                    }
-                                    // Center each character in its box
-                                    let ch_str = ch.to_string();
-                                    let ch_extents = ctx.text_extents(&ch_str)?;
-                                    let char_x = rect_x + (i as f64 * char_width) + (char_width - ch_extents.width()) / 2.0;
-                                    ctx.move_to(char_x, text_y);
-                                    ctx.show_text(&ch_str)?;
+                    if let Some(max) = max_len {
+                        if *max > 0 && *max <= 10 {
+                            // Fixed character spacing
+                            let char_width = rect_w / (*max as f64);
+                            for (i, ch) in text.chars().enumerate() {
+                                if i >= *max as usize {
+                                    break;
                                 }
-                            } else {
-                                // Normal text rendering
-                                ctx.move_to(rect_x + 2.0 * zoom, text_y);
-                                ctx.show_text(text)?;
+                                let ch_str = ch.to_string();
+                                let ch_extents = ctx.text_extents(&ch_str)?;
+                                let char_x = rect_x + (i as f64 * char_width) + (char_width - ch_extents.width()) / 2.0;
+                                ctx.move_to(char_x, text_y);
+                                ctx.show_text(&ch_str)?;
                             }
                         } else {
-                            // Normal text rendering
                             ctx.move_to(rect_x + 2.0 * zoom, text_y);
                             ctx.show_text(text)?;
                         }
+                    } else {
+                        ctx.move_to(rect_x + 2.0 * zoom, text_y);
+                        ctx.show_text(text)?;
                     }
+                }
 
-                    // Draw cursor if focused
-                    if is_focused {
-                        let cursor_pos = form_state.cursor_pos.min(form_state.text_buffer.len());
-                        let cursor_x = if let Some(max) = max_len {
-                            if *max > 0 && *max <= 10 {
-                                // Fixed spacing cursor
-                                let char_width = rect_w / (*max as f64);
-                                rect_x + (cursor_pos as f64 * char_width)
-                            } else {
-                                // Use x_advance to properly measure trailing spaces
-                                let cursor_text = &form_state.text_buffer[..cursor_pos];
-                                rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
-                            }
-                        } else {
-                            // Use x_advance to properly measure trailing spaces
-                            let cursor_text = &form_state.text_buffer[..cursor_pos];
-                            rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
-                        };
-                        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.8);
-                        ctx.set_line_width(1.0);
-                        ctx.move_to(cursor_x, rect_y + 2.0);
-                        ctx.line_to(cursor_x, rect_y + rect_h - 2.0);
-                        ctx.stroke()?;
+                // Draw cursor
+                let cursor_pos = form_state.cursor_pos.min(form_state.text_buffer.len());
+                let cursor_x = if let Some(max) = max_len {
+                    if *max > 0 && *max <= 10 {
+                        let char_width = rect_w / (*max as f64);
+                        rect_x + (cursor_pos as f64 * char_width)
+                    } else {
+                        let cursor_text = &form_state.text_buffer[..cursor_pos];
+                        rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
                     }
-                }
-                crate::forms::FormFieldType::Checkbox { checked } => {
-                    // Draw checkbox
-                    if *checked {
-                        ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
-                        // Draw checkmark
-                        let cx = rect_x + rect_w / 2.0;
-                        let cy = rect_y + rect_h / 2.0;
-                        let size = (rect_w.min(rect_h) * 0.4).min(10.0 * zoom);
-                        ctx.set_line_width(2.0);
-                        ctx.move_to(cx - size * 0.5, cy);
-                        ctx.line_to(cx - size * 0.1, cy + size * 0.4);
-                        ctx.line_to(cx + size * 0.5, cy - size * 0.4);
-                        ctx.stroke()?;
-                    }
-                }
-                crate::forms::FormFieldType::RadioButton { selected, .. } => {
-                    // Draw radio button
-                    if *selected {
-                        ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
-                        let cx = rect_x + rect_w / 2.0;
-                        let cy = rect_y + rect_h / 2.0;
-                        let radius = (rect_w.min(rect_h) * 0.3).min(6.0 * zoom);
-                        ctx.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
-                        ctx.fill()?;
-                    }
-                }
-                crate::forms::FormFieldType::Dropdown { items, selected, .. } => {
-                    // Draw dropdown arrow indicator
-                    ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8);
-                    let arrow_x = rect_x + rect_w - 10.0 * zoom;
-                    let arrow_y = rect_y + rect_h / 2.0;
-                    let arrow_size = 4.0 * zoom;
-                    ctx.move_to(arrow_x - arrow_size, arrow_y - arrow_size / 2.0);
-                    ctx.line_to(arrow_x, arrow_y + arrow_size / 2.0);
-                    ctx.line_to(arrow_x + arrow_size, arrow_y - arrow_size / 2.0);
-                    ctx.stroke()?;
-
-                    // Draw selected item text
-                    if let Some(idx) = selected {
-                        if let Some(text) = items.get(*idx as usize) {
-                            ctx.set_source_rgb(0.0, 0.0, 0.0);
-                            let font_size = (rect_h * 0.7).min(14.0 * zoom);
-                            ctx.set_font_size(font_size);
-                            ctx.move_to(rect_x + 2.0 * zoom, rect_y + rect_h * 0.75);
-                            ctx.show_text(text)?;
-                        }
-                    }
-                }
-                _ => {}
+                } else {
+                    let cursor_text = &form_state.text_buffer[..cursor_pos];
+                    rect_x + 2.0 * zoom + ctx.text_extents(cursor_text)?.x_advance()
+                };
+                ctx.set_source_rgba(0.0, 0.0, 0.0, 0.8);
+                ctx.set_line_width(1.0);
+                ctx.move_to(cursor_x, rect_y + 2.0);
+                ctx.line_to(cursor_x, rect_y + rect_h - 2.0);
+                ctx.stroke()?;
             }
+            crate::forms::FormFieldType::Checkbox { checked } => {
+                // Only draw focus indicator; poppler handles the checkmark
+                // But show our state indicator for immediate feedback during toggle
+                if *checked {
+                    ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
+                    let cx = rect_x + rect_w / 2.0;
+                    let cy = rect_y + rect_h / 2.0;
+                    let size = (rect_w.min(rect_h) * 0.4).min(10.0 * zoom);
+                    ctx.set_line_width(2.0);
+                    ctx.move_to(cx - size * 0.5, cy);
+                    ctx.line_to(cx - size * 0.1, cy + size * 0.4);
+                    ctx.line_to(cx + size * 0.5, cy - size * 0.4);
+                    ctx.stroke()?;
+                }
+            }
+            crate::forms::FormFieldType::RadioButton { selected, .. } => {
+                // Only draw focus indicator; poppler handles the fill
+                if *selected {
+                    ctx.set_source_rgba(0.2, 0.6, 0.2, 0.9);
+                    let cx = rect_x + rect_w / 2.0;
+                    let cy = rect_y + rect_h / 2.0;
+                    let radius = (rect_w.min(rect_h) * 0.3).min(6.0 * zoom);
+                    ctx.arc(cx, cy, radius, 0.0, 2.0 * std::f64::consts::PI);
+                    ctx.fill()?;
+                }
+            }
+            crate::forms::FormFieldType::Dropdown { .. } => {
+                // Just show focus highlight for dropdowns
+            }
+            _ => {}
         }
 
         ctx.restore()?;
