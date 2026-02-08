@@ -85,10 +85,14 @@ pub struct App {
     annotation_scroll: (f64, f64),
     /// Annotation pan drag state (dragging, last_x, last_y)
     annotation_pan_drag: Option<(i32, i32)>,
+    /// Rubber band selection state (start_x, start_y, current_x, current_y) in canvas coords
+    annotation_rubber_band: Option<(i32, i32, i32, i32)>,
     /// Persistent annotation records (shown in sidebar even when not in annotation mode)
     annotation_records: Vec<AnnotationRecord>,
     /// Annotation layer data for overlay (RGBA, width, height)
     annotation_overlay: Option<(Vec<u8>, u32, u32)>,
+    /// Page number the current overlay is for (to clear on page change)
+    annotation_overlay_page: usize,
     /// IPC server for garviewctl
     ipc_server: Option<IpcServer>,
     /// PDF form state
@@ -224,8 +228,10 @@ impl App {
             annotation_zoom: 1.0,
             annotation_scroll: (0.0, 0.0),
             annotation_pan_drag: None,
+            annotation_rubber_band: None,
             annotation_records: Vec::new(),
             annotation_overlay: None,
+            annotation_overlay_page: 0,
             ipc_server: IpcServer::start().ok(),
             form_state: None,
             last_form_click: None,
@@ -422,18 +428,24 @@ impl App {
 
                         match key_event.key {
                             Key::Escape => {
-                                // Exit annotation mode - save if modified
-                                if ann.modified {
-                                    if let Some(path) = self.viewer.current_path() {
-                                        let path = path.to_path_buf();
-                                        if let Err(e) = ann.save_annotations(&path) {
-                                            tracing::error!("Failed to save annotations: {}", e);
+                                // If annotation selected, deselect it
+                                if ann.has_selection() {
+                                    ann.select(None);
+                                    self.needs_redraw = true;
+                                } else {
+                                    // Exit annotation mode - save if modified
+                                    if ann.modified {
+                                        if let Some(path) = self.viewer.current_path() {
+                                            let path = path.to_path_buf();
+                                            if let Err(e) = ann.save_annotations(&path) {
+                                                tracing::error!("Failed to save annotations: {}", e);
+                                            }
                                         }
                                     }
+                                    self.annotation_mode = false;
+                                    self.annotation = None;
+                                    self.needs_redraw = true;
                                 }
-                                self.annotation_mode = false;
-                                self.annotation = None;
-                                self.needs_redraw = true;
                             }
                             // Tool selection shortcuts (only without Ctrl)
                             Key::Char('b') if !key_event.modifiers.ctrl => ann.select_tool(ToolType::Brush),
@@ -485,6 +497,21 @@ impl App {
                             }
                             Key::Char('y') if key_event.modifiers.ctrl => {
                                 let _ = ann.redo();
+                            }
+                            // Delete selected annotation (d or Delete, without Ctrl)
+                            Key::Char('d') if !key_event.modifiers.ctrl => {
+                                if let Ok(deleted) = ann.delete_selected() {
+                                    if deleted {
+                                        tracing::info!("Deleted selected annotation");
+                                    }
+                                }
+                            }
+                            Key::Delete if !key_event.modifiers.ctrl => {
+                                if let Ok(deleted) = ann.delete_selected() {
+                                    if deleted {
+                                        tracing::info!("Deleted selected annotation");
+                                    }
+                                }
                             }
                             // Save annotations to sidecar (Ctrl+S)
                             Key::Char('s') if key_event.modifiers.ctrl => {
@@ -1023,19 +1050,57 @@ impl App {
             InputEvent::MousePress(mouse_event) => {
                 // Annotation mode mouse handling
                 if self.annotation_mode {
-                    // Ctrl+click for pan
-                    if mouse_event.modifiers.ctrl && mouse_event.button == Some(MouseButton::Left) {
+                    // Middle mouse button for pan
+                    if mouse_event.button == Some(MouseButton::Middle) {
                         self.annotation_pan_drag = Some((mouse_event.position.x, mouse_event.position.y));
                         return Ok(true);
                     }
 
                     // Compute offset before mutable borrow
                     let offset = self.annotation_canvas_offset();
+                    let current_page = self.viewer.current_page();
+
+                    // Transform coordinates to canvas space
+                    let canvas_x = ((mouse_event.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
+                    let canvas_y = ((mouse_event.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+
+                    if mouse_event.button == Some(MouseButton::Left) {
+                        // Ctrl+click for rubber band selection
+                        if mouse_event.modifiers.ctrl {
+                            self.annotation_rubber_band = Some((canvas_x, canvas_y, canvas_x, canvas_y));
+                            // Deselect current selection when starting rubber band
+                            if let Some(ref mut ann) = self.annotation {
+                                ann.select(None);
+                            }
+                            self.needs_redraw = true;
+                            return Ok(true);
+                        }
+
+                        // Normal click - check if clicking on existing annotation
+                        if let Some(ref ann) = self.annotation {
+                            if let Some(record) = ann.annotation_at(canvas_x, canvas_y, current_page) {
+                                // Select this annotation
+                                let id = record.id;
+                                if let Some(ref mut ann) = self.annotation {
+                                    ann.select(Some(id));
+                                    tracing::debug!("Selected annotation {}", id);
+                                }
+                                self.needs_redraw = true;
+                                return Ok(true);
+                            }
+                        }
+
+                        // Clicked on empty space - deselect and let tool handle it
+                        if let Some(ref mut ann) = self.annotation {
+                            ann.select(None);
+                        }
+                    }
+
                     if let Some(ref mut ann) = self.annotation {
                         // Transform coordinates from window to canvas space (accounting for zoom)
                         let mut transformed = mouse_event.clone();
-                        transformed.position.x = ((transformed.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
-                        transformed.position.y = ((transformed.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+                        transformed.position.x = canvas_x;
+                        transformed.position.y = canvas_y;
                         match ann.handle_event(&InputEvent::MousePress(transformed)) {
                             Ok(redraw) => {
                                 if redraw {
@@ -1203,6 +1268,48 @@ impl App {
                         return Ok(true);
                     }
 
+                    // Check if rubber band selection was active
+                    if let Some((start_x, start_y, end_x, end_y)) = self.annotation_rubber_band.take() {
+                        let current_page = self.viewer.current_page();
+
+                        // Calculate selection rectangle (normalize coordinates)
+                        let min_x = start_x.min(end_x);
+                        let min_y = start_y.min(end_y);
+                        let max_x = start_x.max(end_x);
+                        let max_y = start_y.max(end_y);
+                        let width = (max_x - min_x) as u32;
+                        let height = (max_y - min_y) as u32;
+
+                        // If rubber band is very small (just a click), expand it for easier selection
+                        let (sel_x, sel_y, sel_w, sel_h) = if width < 10 && height < 10 {
+                            // Small click - expand by 10px in each direction for tolerance
+                            (min_x - 10, min_y - 10, 20, 20)
+                        } else {
+                            (min_x, min_y, width, height)
+                        };
+
+                        let selection_rect = gartk_core::Rect::new(sel_x, sel_y, sel_w, sel_h);
+
+                        // Find all annotations intersecting with rubber band
+                        if let Some(ref ann) = self.annotation {
+                            let matching: Vec<u64> = ann.annotations_in_rect(selection_rect, current_page)
+                                .iter()
+                                .map(|r| r.id)
+                                .collect();
+                            if !matching.is_empty() {
+                                if let Some(ref mut ann) = self.annotation {
+                                    ann.select_multiple(matching.clone());
+                                    tracing::debug!("Rubber band selected {} annotations: {:?}", matching.len(), matching);
+                                }
+                                self.needs_redraw = true;
+                                return Ok(true);
+                            }
+                        }
+
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
+
                     // Compute offset before mutable borrow
                     let offset = self.annotation_canvas_offset();
                     if let Some(ref mut ann) = self.annotation {
@@ -1254,6 +1361,16 @@ impl App {
                         self.annotation_scroll.0 -= dx as f64;
                         self.annotation_scroll.1 -= dy as f64;
                         self.annotation_pan_drag = Some((mouse_event.position.x, mouse_event.position.y));
+                        self.needs_redraw = true;
+                        return Ok(true);
+                    }
+
+                    // Update rubber band selection
+                    if let Some((start_x, start_y, _, _)) = self.annotation_rubber_band {
+                        let offset = self.annotation_canvas_offset();
+                        let canvas_x = ((mouse_event.position.x - offset.0) as f64 / self.annotation_zoom) as i32;
+                        let canvas_y = ((mouse_event.position.y - offset.1) as f64 / self.annotation_zoom) as i32;
+                        self.annotation_rubber_band = Some((start_x, start_y, canvas_x, canvas_y));
                         self.needs_redraw = true;
                         return Ok(true);
                     }
@@ -2125,6 +2242,7 @@ impl App {
             }
             self.annotation_mode = false;
             self.annotation = None;
+            self.annotation_rubber_band = None;
             // Reload overlay from saved file
             self.load_annotations_for_current_file();
             tracing::info!("Exited annotation mode");
@@ -2511,6 +2629,53 @@ impl App {
                 }
                 ctx.paint()?;
 
+                // Draw selection highlight for all selected annotations
+                let current_page = self.viewer.current_page();
+                let selected_records = ann.selected_records();
+                if !selected_records.is_empty() {
+                    // Set up selection styling
+                    ctx.set_source_rgba(0.3, 0.6, 1.0, 0.9);
+                    ctx.set_line_width(2.0 / self.annotation_zoom);
+                    ctx.set_dash(&[6.0 / self.annotation_zoom, 4.0 / self.annotation_zoom], 0.0);
+
+                    for record in selected_records {
+                        if record.page == current_page {
+                            let bounds = &record.bounds;
+                            ctx.rectangle(
+                                bounds.x as f64 - 3.0,
+                                bounds.y as f64 - 3.0,
+                                bounds.width as f64 + 6.0,
+                                bounds.height as f64 + 6.0,
+                            );
+                            ctx.stroke()?;
+                        }
+                    }
+
+                    // Reset dash
+                    ctx.set_dash(&[], 0.0);
+                }
+
+                // Draw rubber band selection rectangle
+                if let Some((start_x, start_y, end_x, end_y)) = self.annotation_rubber_band {
+                    let min_x = start_x.min(end_x) as f64;
+                    let min_y = start_y.min(end_y) as f64;
+                    let width = (start_x - end_x).abs() as f64;
+                    let height = (start_y - end_y).abs() as f64;
+
+                    // Semi-transparent fill
+                    ctx.set_source_rgba(0.3, 0.5, 0.8, 0.2);
+                    ctx.rectangle(min_x, min_y, width, height);
+                    ctx.fill()?;
+
+                    // Dashed border
+                    ctx.set_source_rgba(0.3, 0.5, 0.8, 0.8);
+                    ctx.set_line_width(1.0 / self.annotation_zoom);
+                    ctx.set_dash(&[4.0 / self.annotation_zoom, 4.0 / self.annotation_zoom], 0.0);
+                    ctx.rectangle(min_x, min_y, width, height);
+                    ctx.stroke()?;
+                    ctx.set_dash(&[], 0.0);
+                }
+
                 ctx.restore()?;
 
                 // Draw annotation toolbar at top
@@ -2646,6 +2811,7 @@ impl App {
             let flip_v = self.viewer.is_flipped_v();
             let offset_x = self.viewer.scroll.offset_x;
             let offset_y = self.viewer.scroll.offset_y;
+            let current_page = self.viewer.current_page();
 
             // Render the image
             if let Ok(image_surface) = self.viewer.render(zoom) {
@@ -2711,8 +2877,8 @@ impl App {
                 ctx.source().set_filter(filter);
                 ctx.paint()?;
 
-                // Draw annotation overlay (when not in annotation mode)
-                if !self.annotation_mode {
+                // Draw annotation overlay (when not in annotation mode, only on the page it belongs to)
+                if !self.annotation_mode && current_page == self.annotation_overlay_page {
                     if let Some((ref overlay_data, overlay_w, overlay_h)) = self.annotation_overlay {
                         if let Ok(overlay_surface) = gartk_render::Surface::from_rgba(overlay_data, overlay_w, overlay_h) {
                             // Scale overlay to match image surface dimensions
@@ -4201,7 +4367,9 @@ impl App {
                 Ok(Some((data, width, height))) => {
                     // Use dimensions from the PNG file itself
                     self.annotation_overlay = Some((data, width, height));
-                    tracing::debug!("Loaded annotation overlay {}x{} for {:?}", width, height, path);
+                    // Track which page this overlay is for (currently single-page only)
+                    self.annotation_overlay_page = self.viewer.current_page();
+                    tracing::debug!("Loaded annotation overlay {}x{} for page {} of {:?}", width, height, self.annotation_overlay_page, path);
                 }
                 Ok(None) => {
                     // No annotations file exists
@@ -4321,9 +4489,18 @@ impl App {
         ctx.move_to(x, 25.0);
         ctx.show_text(&format!("Undo:{} Redo:{}", ann.history.undo_count(), ann.history.redo_count()))?;
 
-        // Help text on right
+        // Help text on right (show delete hint if annotation selected)
         ctx.set_source_rgb(0.5, 0.5, 0.5);
-        let help = "Esc:Exit  Ctrl+S:Save  1-9:Colors  +/-:Size";
+        let selection_count = ann.selected().len();
+        let help = if selection_count > 0 {
+            if selection_count == 1 {
+                "[D]elete selected  Esc:Deselect"
+            } else {
+                "[D]elete all  Esc:Deselect"
+            }
+        } else {
+            "Ctrl+drag:Select  Esc:Exit  Ctrl+S:Save"
+        };
         let extents = ctx.text_extents(help)?;
         ctx.move_to(width as f64 - extents.width() - padding, 25.0);
         ctx.show_text(help)?;

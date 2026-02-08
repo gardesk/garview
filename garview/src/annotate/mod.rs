@@ -13,8 +13,60 @@ pub use state::{AnnotationRecord, AnnotationState, SerializableAnnotation, ToolT
 pub use tools::{box_blur, create_tool, Tool};
 
 use anyhow::{Context, Result};
-use gartk_core::InputEvent;
+use gartk_core::{InputEvent, Rect};
 use std::path::Path;
+
+/// Check if a line segment intersects with a rectangle.
+fn line_intersects_rect(x1: i32, y1: i32, x2: i32, y2: i32, rect: &Rect) -> bool {
+    let rx = rect.x as f64;
+    let ry = rect.y as f64;
+    let rw = rect.width as f64;
+    let rh = rect.height as f64;
+
+    // Check if either endpoint is inside the rect
+    let x1f = x1 as f64;
+    let y1f = y1 as f64;
+    let x2f = x2 as f64;
+    let y2f = y2 as f64;
+
+    if (x1f >= rx && x1f <= rx + rw && y1f >= ry && y1f <= ry + rh)
+        || (x2f >= rx && x2f <= rx + rw && y2f >= ry && y2f <= ry + rh)
+    {
+        return true;
+    }
+
+    // Check if line intersects any of the rectangle's edges
+    let edges = [
+        (rx, ry, rx + rw, ry),           // top
+        (rx, ry + rh, rx + rw, ry + rh), // bottom
+        (rx, ry, rx, ry + rh),           // left
+        (rx + rw, ry, rx + rw, ry + rh), // right
+    ];
+
+    for (ex1, ey1, ex2, ey2) in edges {
+        if segments_intersect(x1f, y1f, x2f, y2f, ex1, ey1, ex2, ey2) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if two line segments intersect.
+fn segments_intersect(
+    x1: f64, y1: f64, x2: f64, y2: f64,
+    x3: f64, y3: f64, x4: f64, y4: f64,
+) -> bool {
+    let d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if d.abs() < 0.0001 {
+        return false; // Parallel
+    }
+
+    let t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / d;
+    let u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / d;
+
+    t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0
+}
 
 /// Annotation manager combining canvas, tools, and history.
 pub struct AnnotationManager {
@@ -36,6 +88,8 @@ pub struct AnnotationManager {
     next_id: u64,
     /// Current page (for multi-page documents).
     current_page: usize,
+    /// Currently selected annotation IDs (for deletion).
+    selected_annotations: Vec<u64>,
 }
 
 impl AnnotationManager {
@@ -56,6 +110,7 @@ impl AnnotationManager {
             annotations_redo: Vec::new(),
             next_id: 1,
             current_page: 0,
+            selected_annotations: Vec::new(),
         })
     }
 
@@ -77,6 +132,139 @@ impl AnnotationManager {
     /// Get number of annotations.
     pub fn annotation_count(&self) -> usize {
         self.annotations.len()
+    }
+
+    /// Hit-test annotations at a point, return topmost matching record.
+    /// Uses geometry-aware hit-testing for line-based tools.
+    pub fn annotation_at(&self, x: i32, y: i32, page: usize) -> Option<&AnnotationRecord> {
+        const HIT_TOLERANCE: f64 = 8.0; // pixels
+        // Iterate in reverse (topmost/newest first) for correct z-order
+        self.annotations
+            .iter()
+            .rev()
+            .filter(|a| a.page == page)
+            .find(|a| a.contains_point(x, y, HIT_TOLERANCE))
+    }
+
+    /// Find annotations that intersect with a rectangle (rubber band selection).
+    /// Returns all intersecting annotations (topmost first).
+    pub fn annotations_in_rect(&self, rect: Rect, page: usize) -> Vec<&AnnotationRecord> {
+        // Check if any point of the annotation is within the selection rect
+        // For line-based tools, check if the line intersects the rect
+        self.annotations
+            .iter()
+            .rev()
+            .filter(|a| a.page == page)
+            .filter(|a| {
+                // First check bounding box intersection
+                if !a.bounds.intersects(rect) {
+                    return false;
+                }
+                // For line-based tools, also check if line actually passes through rect
+                match a.tool {
+                    ToolType::Arrow | ToolType::Line => {
+                        if let (Some((x1, y1)), Some((x2, y2))) = (a.start_point, a.end_point) {
+                            // Check if line segment intersects rectangle
+                            line_intersects_rect(x1, y1, x2, y2, &rect)
+                        } else {
+                            true // Fallback to bounds check
+                        }
+                    }
+                    _ => true, // Other tools use bounds
+                }
+            })
+            .collect()
+    }
+
+    /// Find a single annotation that intersects with a rectangle.
+    /// Returns the topmost intersecting annotation.
+    pub fn annotation_in_rect(&self, rect: Rect, page: usize) -> Option<&AnnotationRecord> {
+        self.annotations_in_rect(rect, page).into_iter().next()
+    }
+
+    /// Select an annotation by ID (clears other selections).
+    pub fn select(&mut self, id: Option<u64>) {
+        self.selected_annotations.clear();
+        if let Some(id) = id {
+            self.selected_annotations.push(id);
+        }
+    }
+
+    /// Select multiple annotations by ID (clears previous selections).
+    pub fn select_multiple(&mut self, ids: Vec<u64>) {
+        self.selected_annotations = ids;
+    }
+
+    /// Add an annotation to selection (for Shift+click multi-select).
+    pub fn add_to_selection(&mut self, id: u64) {
+        if !self.selected_annotations.contains(&id) {
+            self.selected_annotations.push(id);
+        }
+    }
+
+    /// Get selected annotation IDs.
+    pub fn selected(&self) -> &[u64] {
+        &self.selected_annotations
+    }
+
+    /// Check if any annotation is selected.
+    pub fn has_selection(&self) -> bool {
+        !self.selected_annotations.is_empty()
+    }
+
+    /// Check if a specific annotation is selected.
+    pub fn is_selected(&self, id: u64) -> bool {
+        self.selected_annotations.contains(&id)
+    }
+
+    /// Get the first selected annotation record (for backwards compatibility).
+    pub fn selected_record(&self) -> Option<&AnnotationRecord> {
+        let id = self.selected_annotations.first()?;
+        self.annotations.iter().find(|a| a.id == *id)
+    }
+
+    /// Get all selected annotation records.
+    pub fn selected_records(&self) -> Vec<&AnnotationRecord> {
+        self.selected_annotations
+            .iter()
+            .filter_map(|id| self.annotations.iter().find(|a| a.id == *id))
+            .collect()
+    }
+
+    /// Delete the selected annotation(s).
+    pub fn delete_selected(&mut self) -> Result<bool> {
+        if self.selected_annotations.is_empty() {
+            return Ok(false);
+        }
+
+        // Save current state for undo
+        let current = self.canvas.snapshot_annotations()?;
+        self.history.push(current);
+
+        // Collect annotations to delete (in reverse order to avoid index shifting issues)
+        let mut indices_to_remove: Vec<usize> = self.selected_annotations
+            .iter()
+            .filter_map(|id| self.annotations.iter().position(|a| a.id == *id))
+            .collect();
+        indices_to_remove.sort_by(|a, b| b.cmp(a)); // Sort descending
+
+        // Erase each annotation region and remove from records
+        for idx in &indices_to_remove {
+            let bounds = self.annotations[*idx].bounds;
+            let id = self.annotations[*idx].id;
+            self.canvas.erase_region(bounds.x, bounds.y, bounds.width, bounds.height)?;
+            tracing::info!("Deleted annotation {} at {:?}", id, bounds);
+            self.annotations.remove(*idx);
+        }
+
+        self.annotations_redo.clear();
+        let count = self.selected_annotations.len();
+        self.selected_annotations.clear();
+        self.modified = true;
+
+        tracing::info!("Deleted {} annotation(s)", count);
+
+        Ok(true)
     }
 
     /// Get the sidecar annotation PNG file path for a given file.
@@ -230,13 +418,27 @@ impl AnnotationManager {
 
         // Record annotation metadata before committing
         if let Some(bounds) = self.tool.bounds() {
-            let record = AnnotationRecord::new(
-                self.next_id,
-                self.state.current_tool,
-                bounds,
-                self.state.properties.color,
-                self.current_page,
-            );
+            let record = if let Some((start, end)) = self.tool.endpoints() {
+                // Line-based tool with endpoints
+                AnnotationRecord::new_with_endpoints(
+                    self.next_id,
+                    self.state.current_tool,
+                    bounds,
+                    self.state.properties.color,
+                    self.current_page,
+                    start,
+                    end,
+                )
+            } else {
+                // Other tools use simple bounding box
+                AnnotationRecord::new(
+                    self.next_id,
+                    self.state.current_tool,
+                    bounds,
+                    self.state.properties.color,
+                    self.current_page,
+                )
+            };
             self.annotations.push(record);
             self.next_id += 1;
         }
