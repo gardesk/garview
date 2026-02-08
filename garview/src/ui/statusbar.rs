@@ -51,6 +51,23 @@ impl StatusBar {
         position: Option<(usize, usize)>,
         filter: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.render_full(renderer, width, y, file_info, zoom_level, zoom_mode, position, filter, false)
+    }
+
+    /// Render the status bar with all options including modified indicator
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_full(
+        &self,
+        renderer: &Renderer,
+        width: u32,
+        y: u32,
+        file_info: Option<&FileInfo>,
+        zoom_level: f64,
+        zoom_mode: ZoomMode,
+        position: Option<(usize, usize)>,
+        filter: Option<&str>,
+        modified: bool,
+    ) -> anyhow::Result<()> {
         let rect = Rect::new(0, y as i32, width, self.height);
 
         // Background
@@ -79,8 +96,10 @@ impl StatusBar {
 
         // Left side: file info or filter
         if let Some(info) = file_info {
+            let modified_prefix = if modified { "* " } else { "" };
             let left_text = format!(
-                "{} - {}x{} - {} - {}",
+                "{}{} - {}x{} - {} - {}",
+                modified_prefix,
                 info.filename,
                 info.width,
                 info.height,
